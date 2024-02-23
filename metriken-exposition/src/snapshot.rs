@@ -65,20 +65,20 @@ impl Snapshot {
     }
 
     #[cfg(feature = "json")]
-    pub fn to_json<T>(val: &T) -> Result<Vec<u8>, JsonError>
+    pub fn to_json<T>(val: &T) -> Result<Vec<u8>, crate::Error>
     where
         T: serde::Serialize + ?Sized,
     {
-        let mut res = serde_json::to_vec(val)?;
+        let mut res = serde_json::to_vec(val).map_err(|e| crate::Error { inner: Box::new(e) })?;
         res.push(b'\n');
         Ok(res)
     }
 
     #[cfg(feature = "msgpack")]
-    pub fn to_msgpack<T>(val: &T) -> Result<Vec<u8>, SerializeMsgpackError>
+    pub fn to_msgpack<T>(val: &T) -> Result<Vec<u8>, crate::Error>
     where
         T: serde::Serialize + ?Sized,
     {
-        rmp_serde::encode::to_vec(val)
+        rmp_serde::encode::to_vec(val).map_err(|e| crate::Error { inner: Box::new(e) })
     }
 }
