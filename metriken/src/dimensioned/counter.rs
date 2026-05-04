@@ -48,7 +48,12 @@ impl<D: MetricDimension> DimensionedCounter<D> {
         self.group.add(dim.index(), value)
     }
 
-    /// Load the current value for `dim`. Returns None if not yet initialized.
+    /// Load the current value for `dim`.
+    ///
+    /// Returns `None` if no write has occurred yet (the backing store is
+    /// uninitialized). This is a pure read — it does not initialize labels;
+    /// call any write method or let exposition (`Metric::value()`) trigger
+    /// label initialization first.
     pub fn value(&self, dim: D) -> Option<u64> {
         self.group.value(dim.index())
     }
@@ -147,7 +152,7 @@ mod tests {
         static C: DimensionedCounter<Side> = DimensionedCounter::new();
 
         C.increment(Side::Left); // initializes backing store + metadata
-        // Right was never written but backing is initialized — should be Some(0)
+                                 // Right was never written but backing is initialized — should be Some(0)
         assert_eq!(C.value(Side::Right), Some(0));
     }
 }
