@@ -81,3 +81,54 @@ pub trait HistogramGroupMetric: Send + Sync + 'static {
     /// Snapshot all metadata.
     fn metadata_snapshot(&self) -> Vec<(usize, HashMap<String, String>)>;
 }
+
+/// A type that maps to a fixed set of labeled metric slots.
+///
+/// Implement this on enums (or tuples of enums) to drive
+/// `DimensionedCounter`, `DimensionedGauge`, and `DimensionedHistogram`.
+/// Use `#[derive(MetricDimension)]` from `metriken-derive` rather than
+/// implementing this by hand.
+pub trait MetricDimension: 'static {
+    /// Total number of distinct values (slots in the dense backing array).
+    const COUNT: usize;
+
+    /// Maps this value to an index in `[0, COUNT)`.
+    fn index(&self) -> usize;
+
+    /// Returns the Prometheus labels for this specific value.
+    fn labels(&self) -> HashMap<String, String>;
+
+    /// Returns labels for every index in order, used to pre-populate
+    /// group metadata so zero-value entries are still exported.
+    fn all_labels() -> Vec<HashMap<String, String>>;
+}
+
+impl<A, B> MetricDimension for (A, B)
+where
+    A: MetricDimension,
+    B: MetricDimension,
+{
+    const COUNT: usize = A::COUNT * B::COUNT;
+
+    fn index(&self) -> usize {
+        self.0.index() * B::COUNT + self.1.index()
+    }
+
+    fn labels(&self) -> HashMap<String, String> {
+        let mut map = self.0.labels();
+        map.extend(self.1.labels());
+        map
+    }
+
+    fn all_labels() -> Vec<HashMap<String, String>> {
+        let mut result = Vec::with_capacity(Self::COUNT);
+        for a_labels in A::all_labels() {
+            for b_labels in B::all_labels() {
+                let mut map = a_labels.clone();
+                map.extend(b_labels);
+                result.push(map);
+            }
+        }
+        result
+    }
+}
