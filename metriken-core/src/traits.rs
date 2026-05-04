@@ -88,11 +88,16 @@ pub trait HistogramGroupMetric: Send + Sync + 'static {
 /// `DimensionedCounter`, `DimensionedGauge`, and `DimensionedHistogram`.
 /// Use `#[derive(MetricDimension)]` from `metriken-derive` rather than
 /// implementing this by hand.
-pub trait MetricDimension: 'static {
+pub trait MetricDimension: Send + Sync + 'static {
     /// Total number of distinct values (slots in the dense backing array).
     const COUNT: usize;
 
     /// Maps this value to an index in `[0, COUNT)`.
+    ///
+    /// # Invariants
+    ///
+    /// The returned index must be in the range `[0, COUNT)`. Implementations
+    /// that return out-of-bounds indices will cause a panic at the call site.
     fn index(&self) -> usize;
 
     /// Returns the Prometheus labels for this specific value.
@@ -100,9 +105,19 @@ pub trait MetricDimension: 'static {
 
     /// Returns labels for every index in order, used to pre-populate
     /// group metadata so zero-value entries are still exported.
+    ///
+    /// # Invariants
+    ///
+    /// The returned vector must be in index-ascending order: `all_labels()[i]`
+    /// must contain the labels for the value that would return `i` from `index()`.
     fn all_labels() -> Vec<HashMap<String, String>>;
 }
 
+/// Composite dimension for tuples of two dimensions.
+///
+/// Merges labels from both `A` and `B` dimensions. If both produce labels
+/// with the same key, `B`'s value takes precedence (last-writer-wins).
+/// Users are responsible for ensuring their dimensions use disjoint label key sets.
 impl<A, B> MetricDimension for (A, B)
 where
     A: MetricDimension,
