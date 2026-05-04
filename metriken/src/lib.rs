@@ -70,11 +70,11 @@
 //! [`linkme`]: https://docs.rs/linkme
 
 mod counter;
+pub mod dimensioned;
 mod gauge;
 pub mod group;
 pub mod histogram;
 mod lazy;
-pub mod dimensioned;
 mod sharded;
 
 extern crate self as metriken;
@@ -88,13 +88,13 @@ pub use metriken_core::{
 pub use metriken_derive::metric;
 
 pub use crate::counter::Counter;
+pub use crate::dimensioned::{DimensionedCounter, DimensionedGauge};
 #[doc(inline)]
 pub use crate::dynmetrics::{DynBoxedMetric, DynPinnedMetric, MetricBuilder};
 pub use crate::gauge::Gauge;
 pub use crate::group::{CounterGroup, GaugeGroup, HistogramGroup};
 pub use crate::histogram::{AtomicHistogram, RwLockHistogram};
 pub use crate::lazy::Lazy;
-pub use crate::dimensioned::DimensionedCounter;
 pub use crate::sharded::{set_thread_shard, ShardedCounterGroup};
 
 /// A counter holds a unsigned 64bit monotonically non-decreasing value. The
