@@ -85,7 +85,7 @@ pub use metriken_core::{
     GaugeGroupMetric, HistogramGroupMetric, HistogramMetric, Metadata, MetadataIter, Metric,
     MetricDimension, MetricEntry, Metrics, MetricsIter, Value,
 };
-pub use metriken_derive::metric;
+pub use metriken_derive::{metric, MetricDimension};
 
 pub use crate::counter::Counter;
 pub use crate::dimensioned::{DimensionedCounter, DimensionedGauge, DimensionedHistogram};
