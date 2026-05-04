@@ -88,7 +88,7 @@ pub use metriken_core::{
 pub use metriken_derive::metric;
 
 pub use crate::counter::Counter;
-pub use crate::dimensioned::{DimensionedCounter, DimensionedGauge};
+pub use crate::dimensioned::{DimensionedCounter, DimensionedGauge, DimensionedHistogram};
 #[doc(inline)]
 pub use crate::dynmetrics::{DynBoxedMetric, DynPinnedMetric, MetricBuilder};
 pub use crate::gauge::Gauge;
