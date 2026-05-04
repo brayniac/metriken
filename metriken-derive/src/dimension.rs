@@ -3,9 +3,7 @@ use proc_macro2::TokenStream;
 use quote::quote;
 use syn::{Data, DeriveInput, Fields};
 
-pub(crate) fn derive_metric_dimension(
-    input: proc_macro::TokenStream,
-) -> proc_macro::TokenStream {
+pub(crate) fn derive_metric_dimension(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
     let ast: DeriveInput = syn::parse(input).expect("failed to parse derive input");
     match impl_metric_dimension(ast) {
         Ok(ts) => ts.into(),
@@ -36,8 +34,8 @@ fn impl_metric_dimension(ast: DeriveInput) -> syn::Result<TokenStream> {
     }
 
     // Label key: snake_case of enum name, overridable via #[metric_dimension(name="...")]
-    let label_key = get_dimension_name_override(&ast)
-        .unwrap_or_else(|| enum_name.to_string().to_snake_case());
+    let label_key =
+        get_dimension_name_override(&ast).unwrap_or_else(|| enum_name.to_string().to_snake_case());
 
     let count = variants.len();
     let variant_idents: Vec<_> = variants.iter().map(|v| &v.ident).collect();
@@ -47,15 +45,21 @@ fn impl_metric_dimension(ast: DeriveInput) -> syn::Result<TokenStream> {
         .map(|id| id.to_string().to_snake_case())
         .collect();
 
-    let index_arms = variant_idents.iter().zip(variant_indices.iter()).map(|(id, idx)| {
-        quote! { Self::#id => #idx }
-    });
+    let index_arms = variant_idents
+        .iter()
+        .zip(variant_indices.iter())
+        .map(|(id, idx)| {
+            quote! { Self::#id => #idx }
+        });
 
-    let labels_arms = variant_idents.iter().zip(label_values.iter()).map(|(id, val)| {
-        quote! {
-            Self::#id => { map.insert(#label_key.to_string(), #val.to_string()); }
-        }
-    });
+    let labels_arms = variant_idents
+        .iter()
+        .zip(label_values.iter())
+        .map(|(id, val)| {
+            quote! {
+                Self::#id => { map.insert(#label_key.to_string(), #val.to_string()); }
+            }
+        });
 
     let all_labels_entries = label_values.iter().map(|val| {
         quote! {{
