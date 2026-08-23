@@ -386,7 +386,7 @@ impl MetricsSource for UnionMetricsSource {
         opts: &QueryOptions,
     ) -> Result<QueryResult, QueryError> {
         self.engine
-            .query_range_opts(expr, start_s, end_s, step_s, opts.rate_mode)
+            .query_range_opts(expr, start_s, end_s, step_s, opts)
     }
 
     fn query(&self, expr: &str, time: Option<f64>) -> Result<QueryResult, QueryError> {

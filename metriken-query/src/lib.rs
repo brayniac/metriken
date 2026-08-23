@@ -90,17 +90,71 @@ pub enum RateMode {
 /// Query-evaluation options threaded into the streaming engine. Additive and
 /// `#[non_exhaustive]`: new knobs can be added without breaking callers, and
 /// `QueryOptions::default()` reproduces today's default behavior.
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Default)]
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
 #[non_exhaustive]
 pub struct QueryOptions {
     /// Rate/irate time-alignment mode. See [`RateMode`].
     pub rate_mode: RateMode,
+    /// Averaging span for `rate`/`irate`, in nanoseconds — the window each
+    /// value is computed over, as distinct from the spacing between values.
+    ///
+    /// `None` (the default) means "one step", which is the historical
+    /// behaviour: each point is the increase across the step that precedes it.
+    ///
+    /// Setting it wider SMOOTHS without changing point placement. That
+    /// distinction is the whole reason this exists. When a query combines a
+    /// fast source with a slow one, the points that survive are those where
+    /// both have data — the slow source's real read times — and at each of
+    /// those the two operands were sampled nearly together, which is what
+    /// keeps their combined uncertainty band tight. Coarsening the STEP to
+    /// smooth the fast side destroys that: the grid then lands where the slow
+    /// source has no reading, its window is interpolated across the whole gap,
+    /// and the band explodes (measured: 0.85% wide before, 6.7x after).
+    ///
+    /// Widening the span instead smooths the fast operand while leaving the
+    /// grid — and therefore the simultaneity — alone.
+    pub rate_span_ns: Option<u64>,
+    /// Evaluate at THESE timestamps instead of on a uniform grid.
+    ///
+    /// The grid is uniform by default: `start`, `start + step`, … Every value
+    /// is therefore produced wherever the grid happens to fall, which is
+    /// rarely where a slow source actually took a reading — so its value gets
+    /// held or interpolated between real observations, and anything combined
+    /// with it inherits that as uncertainty.
+    ///
+    /// A slow source's readings are not evenly spaced either. Measured on a
+    /// real recording, one sampler's rows fell 30 s apart and then 60 s apart,
+    /// so NO uniform grid can sit on them at any step or phase. Supplying the
+    /// timestamps explicitly is the only way to evaluate where the data
+    /// genuinely is.
+    ///
+    /// When set, each rate's averaging window is the gap to the preceding
+    /// timestamp — so the uniform grid is just the special case where those
+    /// gaps are all equal.
+    pub eval_timestamps: Option<std::sync::Arc<[u64]>>,
 }
 
 impl QueryOptions {
     /// Construct options selecting a specific [`RateMode`].
     pub fn with_rate_mode(rate_mode: RateMode) -> Self {
-        Self { rate_mode }
+        Self {
+            rate_mode,
+            rate_span_ns: None,
+            eval_timestamps: None,
+        }
+    }
+
+    /// Evaluate at an explicit timestamp list. See
+    /// [`QueryOptions::eval_timestamps`].
+    pub fn with_eval_timestamps(mut self, ts: Option<std::sync::Arc<[u64]>>) -> Self {
+        self.eval_timestamps = ts;
+        self
+    }
+
+    /// Set the rate averaging span. See [`QueryOptions::rate_span_ns`].
+    pub fn with_rate_span_ns(mut self, span_ns: Option<u64>) -> Self {
+        self.rate_span_ns = span_ns;
+        self
     }
 }
 
@@ -456,6 +510,23 @@ pub trait MetricsSource: Send + Sync {
     /// sources that don't track it (e.g. live `MemoryStore`).
     fn sample_timestamps(&self) -> Vec<u64> {
         Vec::new()
+    }
+
+    /// The same rows as [`sample_timestamps`](Self::sample_timestamps), snapped
+    /// to the nominal sampling grid exactly as the query path snaps them.
+    ///
+    /// This is the form to use when deciding WHERE a series has data — for
+    /// instance to build [`QueryOptions::eval_timestamps`]. The query path
+    /// indexes samples by the snapped value, so a caller reasoning from raw
+    /// values is reasoning about instants the engine will never produce: on a
+    /// 1 s nominal grid a row recorded at 1.5 s is indexed at 2.0 s, and asking
+    /// for a value at 1.5 s falls before the series' first sample and silently
+    /// yields no point.
+    ///
+    /// Defaults to the raw form, which is correct for sources that do not
+    /// snap.
+    fn snapped_sample_timestamps(&self) -> Vec<u64> {
+        self.sample_timestamps()
     }
 }
 

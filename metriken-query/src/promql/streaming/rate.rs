@@ -86,6 +86,20 @@ pub struct CounterGridRate<'a> {
     cursor_ns: u64,
     end_ns: u64,
     step_ns: u64,
+    /// Averaging window per emitted point. Equal to `step_ns` for the classic
+    /// behaviour; wider smooths each value without moving the points.
+    span_ns: u64,
+    /// Explicit evaluation timestamps, when the caller supplied them. Each
+    /// value is then the increase across the gap from the PRECEDING timestamp,
+    /// which makes the uniform grid the special case where every gap is
+    /// `step_ns`.
+    ///
+    /// This exists because a slow source's readings are not evenly spaced —
+    /// measured 30 s then 60 s apart on a real recording — so no uniform grid
+    /// can land on them. Evaluating where the data actually is keeps a
+    /// combined value simultaneous with its slow operand instead of
+    /// interpolating that operand across the gap.
+    points: Option<(std::sync::Arc<[u64]>, usize)>,
     windows: Option<&'a [(u64, u64)]>,
     done: bool,
 }
@@ -97,6 +111,8 @@ impl<'a> CounterGridRate<'a> {
         start_ns: u64,
         end_ns: u64,
         step_ns: u64,
+        // Averaging window per point; see the field of the same name.
+        span_ns: u64,
         windows: Option<&'a [(u64, u64)]>,
     ) -> Self {
         // Reset-adjusted cumulative: same convention as CounterRate's
@@ -123,6 +139,8 @@ impl<'a> CounterGridRate<'a> {
             cursor_ns: start_ns,
             end_ns,
             step_ns,
+            span_ns: span_ns.max(1),
+            points: None,
             windows,
             done: step_ns == 0 || timestamps.len() < 2,
         }
@@ -175,24 +193,58 @@ impl<'a> CounterGridRate<'a> {
     }
 }
 
+impl<'a> CounterGridRate<'a> {
+    /// Evaluate at `points` rather than on the uniform grid. Each emitted
+    /// value covers the gap from the previous point, so the caller's choice of
+    /// timestamps sets both placement AND averaging window.
+    pub(crate) fn at_points(mut self, points: std::sync::Arc<[u64]>) -> Self {
+        self.points = Some((points, 0));
+        self
+    }
+}
+
 impl<'a> Iterator for CounterGridRate<'a> {
     type Item = Point;
 
     fn next(&mut self) -> Option<Point> {
-        while !self.done && self.cursor_ns <= self.end_ns {
-            let t = self.cursor_ns;
-            match self.cursor_ns.checked_add(self.step_ns) {
-                Some(next) => self.cursor_ns = next,
-                None => self.done = true,
-            }
-
-            let Some(left) = t.checked_sub(self.step_ns) else {
-                continue;
+        while !self.done {
+            // Two placements, one body. Explicit points take their window from
+            // the preceding point; the uniform grid takes it from `span_ns`.
+            let (t, left) = match &mut self.points {
+                Some((points, idx)) => {
+                    // Each value spans one gap, so N points yield N-1 values:
+                    // the first has no predecessor to measure across, the same
+                    // rule the grid follows at `start`, which needs a step of
+                    // lookback before it can emit.
+                    let i = *idx;
+                    *idx += 1;
+                    let (&prev, &t) = (points.get(i)?, points.get(i + 1)?);
+                    if t > self.end_ns || t <= prev {
+                        continue;
+                    }
+                    (t, prev)
+                }
+                None => {
+                    if self.cursor_ns > self.end_ns {
+                        return None;
+                    }
+                    let t = self.cursor_ns;
+                    match self.cursor_ns.checked_add(self.step_ns) {
+                        Some(next) => self.cursor_ns = next,
+                        None => self.done = true,
+                    }
+                    // The averaging window, which may be wider than the point
+                    // spacing — see `span_ns`.
+                    let Some(left) = t.checked_sub(self.span_ns) else {
+                        continue;
+                    };
+                    (t, left)
+                }
             };
             let (Some(v_hi), Some(v_lo)) = (self.interp(t), self.interp(left)) else {
                 continue;
             };
-            let step_s = self.step_ns as f64 / 1e9;
+            let step_s = (t - left) as f64 / 1e9;
             if step_s <= 0.0 {
                 continue;
             }
@@ -252,6 +304,7 @@ mod tests {
             0,             // start_ns (already snapped by the caller)
             3_000_000_000, // end_ns
             1_000_000_000, // step_ns
+            1_000_000_000, // span_ns (classic: one step per point)
             None,          // windows
         )
         .collect();
@@ -272,8 +325,16 @@ mod tests {
         // distinguishes Grid from a naive per-window sum.
         let ts = [500_000_000u64, 1_500_000_000, 2_500_000_000];
         let vals = [0u64, 100, 200];
-        let pts: Vec<Point> =
-            CounterGridRate::new(&ts, &vals, 0, 3_000_000_000, 1_000_000_000, None).collect();
+        let pts: Vec<Point> = CounterGridRate::new(
+            &ts,
+            &vals,
+            0,
+            3_000_000_000,
+            1_000_000_000,
+            1_000_000_000,
+            None,
+        )
+        .collect();
         assert_eq!(pts.len(), 1, "only the interior grid point is emitted");
         assert_eq!(pts[0].t, 2_000_000_000);
         // V(2s)=150 (interp 1.5→2.5), V(1s)=50 (interp 0.5→1.5) → 100/s.
@@ -286,13 +347,129 @@ mod tests {
         // 100, 50, 100 over 1s each.
         let ts = [0u64, 1_000_000_000, 2_000_000_000, 3_000_000_000];
         let vals = [0u64, 100, 50, 150];
-        let pts: Vec<Point> =
-            CounterGridRate::new(&ts, &vals, 0, 3_000_000_000, 1_000_000_000, None).collect();
+        let pts: Vec<Point> = CounterGridRate::new(
+            &ts,
+            &vals,
+            0,
+            3_000_000_000,
+            1_000_000_000,
+            1_000_000_000,
+            None,
+        )
+        .collect();
         let vs: Vec<f64> = pts.iter().map(|p| p.v).collect();
         assert_eq!(vs.len(), 3);
         assert!((vs[0] - 100.0).abs() < 1e-6, "{vs:?}");
         assert!((vs[1] - 50.0).abs() < 1e-6, "{vs:?}");
         assert!((vs[2] - 100.0).abs() < 1e-6, "{vs:?}");
+    }
+
+    /// A span wider than the step smooths each value WITHOUT moving the
+    /// points.
+    ///
+    /// That separation is the whole reason the span exists. Coarsening the
+    /// step to smooth also relocates the evaluation grid, and when a query
+    /// combines a fast source with a slow one the grid then lands where the
+    /// slow source has no reading — its window gets interpolated across the
+    /// gap and the combined uncertainty band explodes. Widening the span
+    /// leaves the grid, and therefore the points where both sources really
+    /// have data, exactly where they were.
+    /// The first evaluation point may coincide exactly with the first sample,
+    /// and the point that measures across from it must still be emitted.
+    ///
+    /// This is the normal case when the points come from a series' own rows,
+    /// so an interpolation that demanded a strictly-earlier sample would drop
+    /// the first value of every such query.
+    #[test]
+    fn a_first_point_on_the_first_sample_still_yields_the_next_rate() {
+        const S: u64 = 1_000_000_000;
+        let ts = [1_500_000_000u64, 4_500_000_000, 10_500_000_000];
+        let vals = [1u64, 7, 19];
+        let points: std::sync::Arc<[u64]> =
+            vec![1_500_000_000u64, 4_500_000_000, 10_500_000_000].into();
+        let pts: Vec<Point> = CounterGridRate::new(&ts, &vals, 0, 14 * S, S, S, None)
+            .at_points(points)
+            .collect();
+        let times: Vec<u64> = pts.iter().map(|p| p.t).collect();
+        assert_eq!(times, vec![4_500_000_000, 10_500_000_000], "got {times:?}");
+    }
+
+    /// Explicit evaluation points land exactly where asked, even when they
+    /// are IRREGULARLY spaced, and each value covers the gap it follows.
+    ///
+    /// Irregularity is the reason this mode exists. A slow sampler's readings
+    /// are not evenly spaced — measured 30 s apart and then 60 s apart on a
+    /// real recording — so no uniform grid can sit on them at any step or
+    /// phase. Evaluating on the grid instead forces the slow operand to be
+    /// held or interpolated between real readings, and whatever it is combined
+    /// with inherits that as uncertainty.
+    #[test]
+    fn explicit_points_are_honoured_including_irregular_spacing() {
+        const S: u64 = 1_000_000_000;
+        // A counter climbing by 100/s, sampled every second.
+        let ts: Vec<u64> = (0..=10).map(|i| i * S).collect();
+        let vals: Vec<u64> = (0..=10).map(|i| i * 100).collect();
+
+        // 30 s / 60 s in miniature: gaps of 2 s then 4 s.
+        let points: std::sync::Arc<[u64]> = vec![2 * S, 4 * S, 8 * S].into();
+        let pts: Vec<Point> = CounterGridRate::new(&ts, &vals, 0, 10 * S, S, S, None)
+            .at_points(points)
+            .collect();
+
+        let times: Vec<u64> = pts.iter().map(|p| p.t).collect();
+        assert_eq!(
+            times,
+            vec![4 * S, 8 * S],
+            "values land on the supplied points; the first has no predecessor \
+             to measure a rate from, exactly as the grid's start does"
+        );
+
+        // The rate is constant, so an uneven gap must not distort it — that is
+        // what proves the divisor is the ACTUAL gap and not a fixed span.
+        for p in &pts {
+            assert!(
+                (p.v - 100.0).abs() < 1e-6,
+                "a steady 100/s counter must read 100/s over any gap, got {}",
+                p.v
+            );
+        }
+    }
+
+    #[test]
+    fn a_wider_span_smooths_without_moving_the_points() {
+        // A deliberately jagged counter: +0, +200, +0, +200 …
+        let ts: Vec<u64> = (0..=6).map(|i| i * 1_000_000_000).collect();
+        let vals: [u64; 7] = [0, 0, 200, 200, 400, 400, 600];
+
+        let at = |span: u64| -> Vec<Point> {
+            CounterGridRate::new(&ts, &vals, 0, 6_000_000_000, 1_000_000_000, span, None).collect()
+        };
+
+        let narrow = at(1_000_000_000);
+        let wide = at(2_000_000_000);
+
+        // Points are on the same grid either way — only their VALUES differ.
+        let narrow_t: Vec<u64> = narrow.iter().map(|p| p.t).collect();
+        let wide_t: Vec<u64> = wide.iter().map(|p| p.t).collect();
+        assert_eq!(
+            narrow_t.iter().filter(|t| wide_t.contains(t)).count(),
+            wide_t.len(),
+            "a wider span must not relocate the grid: narrow={narrow_t:?} \
+             wide={wide_t:?}"
+        );
+
+        let spread = |pts: &[Point]| -> f64 {
+            let v: Vec<f64> = pts.iter().map(|p| p.v).collect();
+            let mean = v.iter().sum::<f64>() / v.len() as f64;
+            (v.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / v.len() as f64).sqrt()
+        };
+
+        assert!(
+            spread(&wide) < spread(&narrow),
+            "a wider span must smooth: narrow spread {:.1}, wide spread {:.1}",
+            spread(&narrow),
+            spread(&wide)
+        );
     }
 
     #[test]
@@ -305,9 +482,16 @@ mod tests {
             (1_980_000_000u64, 2_000_000_000u64),
             (2_980_000_000u64, 3_000_000_000u64),
         ];
-        let pts: Vec<Point> =
-            CounterGridRate::new(&ts, &vals, 0, 3_000_000_000, 1_000_000_000, Some(&windows))
-                .collect();
+        let pts: Vec<Point> = CounterGridRate::new(
+            &ts,
+            &vals,
+            0,
+            3_000_000_000,
+            1_000_000_000,
+            1_000_000_000,
+            Some(&windows),
+        )
+        .collect();
         // t=1s dropped (left edge 0 precedes first sample); emit t=2s, t=3s.
         assert_eq!(
             pts.iter().map(|p| p.t).collect::<Vec<_>>(),
