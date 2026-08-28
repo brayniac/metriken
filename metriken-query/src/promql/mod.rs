@@ -10,6 +10,7 @@ use crate::labels::Labels;
 use crate::{DataSource, QueryOptions};
 
 mod columns;
+pub use columns::referenced_metrics;
 pub(crate) mod streaming;
 
 #[cfg(test)]

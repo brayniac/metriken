@@ -2609,3 +2609,83 @@ fn test_parquet_builder_reader_and_reader_labeled_compile() {
         let _ = crate::ParquetReader::builder().reader_labeled(r2, [("run", "b")]);
     }
 }
+
+// ── referenced_metrics: routing without a source ─────────────────────────
+//
+// A reader holding many tables uses these names to decide which tables a query
+// could touch, before opening any of them. Over-matching costs an unnecessary
+// open; under-matching silently drops a table the query needed, so the bias
+// here is deliberately toward returning a name.
+
+#[test]
+fn referenced_metrics_collects_a_bare_selector() {
+    let m = crate::referenced_metrics("cpu_usage").unwrap();
+    assert_eq!(m, ["cpu_usage".to_string()].into_iter().collect());
+}
+
+#[test]
+fn referenced_metrics_reaches_through_functions_and_aggregates() {
+    let m = crate::referenced_metrics("sum(rate(cpu_usage[1m]))").unwrap();
+    assert_eq!(m, ["cpu_usage".to_string()].into_iter().collect());
+}
+
+/// The case routing exists for: a binary op whose sides live in different
+/// tables. Both names must come back or one table never gets opened.
+#[test]
+fn referenced_metrics_collects_both_sides_of_a_binary_op() {
+    let m =
+        crate::referenced_metrics("sum(rate(cpu_instructions[1m])) / sum(rate(cpu_cycles[1m]))")
+            .unwrap();
+    assert_eq!(
+        m,
+        ["cpu_instructions".to_string(), "cpu_cycles".to_string()]
+            .into_iter()
+            .collect()
+    );
+}
+
+#[test]
+fn referenced_metrics_reads_the_name_matcher_form() {
+    let m = crate::referenced_metrics(r#"{__name__="cpu_usage"}"#).unwrap();
+    assert_eq!(m, ["cpu_usage".to_string()].into_iter().collect());
+}
+
+/// Label matchers are ignored on purpose: a table holding the metric but no
+/// matching series answers with an empty result, which is correct. Skipping it
+/// on a label mismatch would be routing on data the catalog does not have.
+#[test]
+fn referenced_metrics_ignores_label_matchers() {
+    let m = crate::referenced_metrics(r#"cpu_usage{id="3"}"#).unwrap();
+    assert_eq!(m, ["cpu_usage".to_string()].into_iter().collect());
+}
+
+#[test]
+fn referenced_metrics_handles_the_rezolus_quantiles_wrapper() {
+    let m = crate::referenced_metrics("histogram_quantiles([0.5,0.9], blockio_latency)").unwrap();
+    assert!(m.contains("blockio_latency"), "got {m:?}");
+}
+
+#[test]
+fn referenced_metrics_is_empty_for_a_scalar_and_errors_on_syntax() {
+    assert!(crate::referenced_metrics("42").unwrap().is_empty());
+    assert!(crate::referenced_metrics("sum(((").is_err());
+}
+
+/// `referenced_metrics` must not narrow what `columns` would have matched:
+/// every metric name behind a physical column `columns` returns has to appear
+/// here, or routing drops a table the query engine would then need.
+#[test]
+fn referenced_metrics_is_a_superset_of_what_columns_resolves() {
+    for q in [
+        "cpu_usage",
+        "sum(rate(cpu_usage[1m]))",
+        "sum(rate(cpu_usage[1m])) / sum(rate(cpu_cycles[1m]))",
+        r#"cpu_usage{id="0"}"#,
+    ] {
+        let names = crate::referenced_metrics(q).unwrap();
+        assert!(
+            !names.is_empty(),
+            "{q}: routing would open nothing and the query would be refused"
+        );
+    }
+}
