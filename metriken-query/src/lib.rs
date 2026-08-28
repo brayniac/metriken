@@ -55,7 +55,9 @@ pub use buffer_pool::{BufferPool, BufferPoolStats};
 pub use display::{DisplayOptions, DisplayResult, DisplaySeries, EnvPoint, Reducer};
 pub use memory_store::{MemoryStore, MemoryStoreBuilder};
 pub use parquet::{ParquetBuilder, ParquetReader};
-pub use promql::{HistogramHeatmapResult, MatrixSample, QueryError, QueryResult, Sample};
+pub use promql::{
+    referenced_metrics, HistogramHeatmapResult, MatrixSample, QueryError, QueryResult, Sample,
+};
 pub use segmented::SegmentedParquetReader;
 pub use union::{UnionChild, UnionError, UnionMetricsSource};
 

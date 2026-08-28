@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`referenced_metrics(query)` — the metric names a query names, without a
+  data source.** `QueryEngine::columns` answers a related question, but it needs
+  the source's column map to expand a selector into its labelled series, so the
+  source must already be open. A caller deciding *which* source to open cannot
+  have that yet.
+
+  This is for a reader holding many tables: it can now decide which tables a
+  query could possibly touch before opening any of them. In a `.rez` archive of
+  50 tables and 418 segments, a typical query touches 11% of them — the rest
+  were being opened and discarded, at a measured ~1.37 ms per segment.
+
+  Label matchers are ignored deliberately. Routing asks "could this table answer
+  the query"; a table holding the metric with no matching series answers with an
+  empty result, which is correct, whereas skipping it on a label mismatch would
+  route on data the caller does not have.
+
 ## [0.20.0]
 
 ### Added

@@ -34,6 +34,74 @@ impl QueryEngine {
     }
 }
 
+/// The metric names a PromQL query references, without a data source.
+///
+/// [`QueryEngine::columns`] answers a related question — which *physical*
+/// columns a query touches — but it needs the source's column map to expand a
+/// selector into its labelled series, which means the source must already be
+/// open. A caller routing a query *to* a source cannot have that yet.
+///
+/// This walks the same AST and collects the selector names only, so a reader
+/// holding many tables can decide which of them a query could possibly touch
+/// before opening any. Label matchers are deliberately ignored: routing needs
+/// "could this table answer the query", and a name present with no matching
+/// labels is a table that answers with an empty result, not one to skip.
+///
+/// Returns an empty set for a query that references no named metric (a bare
+/// scalar, say). Returns `QueryError::ParseError` on syntax error, matching
+/// `columns`.
+pub fn referenced_metrics(query: &str) -> Result<HashSet<String>, QueryError> {
+    let stripped = strip_rezolus_wrapper(query)?;
+    let expr = parser::parse(stripped)
+        .map_err(|e| QueryError::ParseError(format!("Failed to parse query: {e:?}")))?;
+    let mut out = HashSet::new();
+    walk_names(&expr, &mut out);
+    Ok(out)
+}
+
+/// Mirror of [`walk`] that collects selector names instead of columns. Kept
+/// beside it deliberately: the two must stay in step as the expression grammar
+/// grows, and a missed arm here silently narrows routing rather than failing
+/// loudly.
+fn walk_names(expr: &Expr, out: &mut HashSet<String>) {
+    match expr {
+        Expr::Aggregate(agg) => walk_names(&agg.expr, out),
+        Expr::Unary(u) => walk_names(&u.expr, out),
+        Expr::Binary(b) => {
+            walk_names(&b.lhs, out);
+            walk_names(&b.rhs, out);
+        }
+        Expr::Paren(p) => walk_names(&p.expr, out),
+        Expr::Call(call) => {
+            for arg in &call.args.args {
+                walk_names(arg, out);
+            }
+        }
+        Expr::VectorSelector(sel) => collect_selector_names(sel, out),
+        Expr::MatrixSelector(sel) => collect_selector_names(&sel.vs, out),
+        Expr::Subquery(s) => walk_names(&s.expr, out),
+        Expr::NumberLiteral(_) | Expr::StringLiteral(_) | Expr::Extension(_) => {}
+    }
+}
+
+/// A selector names a metric either as `foo` or as `{__name__="foo"}`; both
+/// forms route the same, so both are collected.
+fn collect_selector_names(sel: &parser::VectorSelector, out: &mut HashSet<String>) {
+    if let Some(n) = sel.name.as_deref() {
+        out.insert(n.to_string());
+    }
+    for m in sel
+        .matchers
+        .matchers
+        .iter()
+        .filter(|m| m.name == "__name__")
+    {
+        if !m.value.is_empty() {
+            out.insert(m.value.clone());
+        }
+    }
+}
+
 fn strip_rezolus_wrapper(query: &str) -> Result<&str, QueryError> {
     if let Some(inner) = query
         .strip_prefix("histogram_quantiles(")
