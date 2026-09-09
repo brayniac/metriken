@@ -44,7 +44,7 @@ use super::{Band, LabeledSeries, Point, RateEdges, SeriesSet};
 /// band, and the acquisition edges the band came from. The edges are carried
 /// for the same reason the zip path carries them — without them this path
 /// could not tell a same-read combination from a cross-table one.
-type RightLookup = HashMap<u64, (f64, Option<Band>, Option<RateEdges>)>;
+type RightLookup = HashMap<u64, (f64, Option<Band>, Option<RateEdges>, bool)>;
 
 /// Subset of PromQL binary operators the streaming pipeline
 /// recognises. Maps directly onto the eager `apply_binary_op`
@@ -237,6 +237,7 @@ impl<I: Iterator<Item = Point>> Iterator for ScalarBroadcast<I> {
                     // point still belongs to the read it came from, so a later
                     // cross-table combination can still detect that.
                     edges: p.edges,
+                    interpolated: p.interpolated,
                 });
             }
             // Skip on division by zero, mirroring the eager path's
@@ -362,6 +363,9 @@ impl<'a> Iterator for ZipMergeBinary<'a> {
                             v,
                             bounds,
                             edges,
+                            // Either side spanning an unobserved stretch makes
+                            // the combination one too.
+                            interpolated: left.interpolated || right.interpolated,
                         });
                     }
                 }
@@ -386,7 +390,7 @@ impl<'a> Iterator for RightLookupBinary<'a> {
 
     fn next(&mut self) -> Option<Point> {
         for p in self.upstream.by_ref() {
-            if let Some(&(rv, rb, re)) = self.rhs.get(&p.t) {
+            if let Some(&(rv, rb, re, r_interp)) = self.rhs.get(&p.t) {
                 if let Some(v) = self.op.apply(p.v, rv) {
                     let bounds = combine_bounds(self.op, p.v, p.bounds, p.edges, rv, rb, re);
                     let edges = if p.edges == re { p.edges } else { None };
@@ -395,6 +399,7 @@ impl<'a> Iterator for RightLookupBinary<'a> {
                         v,
                         bounds,
                         edges,
+                        interpolated: p.interpolated || r_interp,
                     });
                 }
             }
@@ -453,7 +458,7 @@ pub fn matrix_matrix_op<'a>(
         let rhs: Rc<RightLookup> = Rc::new(
             right_singleton
                 .iter
-                .map(|p| (p.t, (p.v, p.bounds, p.edges)))
+                .map(|p| (p.t, (p.v, p.bounds, p.edges, p.interpolated)))
                 .collect(),
         );
         for left in unmatched_left {
@@ -599,12 +604,14 @@ mod interval_tests {
             v: 100.0,
             bounds: Some((80.0, 120.0)),
             edges: None,
+            interpolated: false,
         }));
         let r: Box<dyn Iterator<Item = Point>> = Box::new(std::iter::once(Point {
             t: 1,
             v: 10.0,
             bounds: Some((8.0, 12.0)),
             edges: None,
+            interpolated: false,
         }));
         let mut z = ZipMergeBinary {
             left: l.peekable(),
@@ -632,6 +639,7 @@ mod interval_tests {
             v: 0.1,
             bounds: Some((-4.0, 4.0)),
             edges: None,
+            interpolated: false,
         }));
         let mut sb = ScalarBroadcast {
             upstream: up,
@@ -657,6 +665,7 @@ mod interval_tests {
             v: 10.0,
             bounds: Some((8.0, 12.0)),
             edges: None,
+            interpolated: false,
         }));
         let mut sb = ScalarBroadcast {
             upstream: up,

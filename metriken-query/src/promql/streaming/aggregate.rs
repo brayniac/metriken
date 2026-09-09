@@ -132,6 +132,7 @@ impl<'a> Iterator for MergeReduce<'a> {
         // Interval arithmetic for sum/avg: a windowless child contributes its
         // point value as a degenerate band [v, v].
         let mut any_bounded = false;
+        let mut any_interpolated = false;
         let (mut lo_sum, mut hi_sum) = (0.0f64, 0.0f64);
         // Unanimity tracking for the acquisition edges: `Some(e)` while every
         // contributor so far carried exactly `e`, `None` the moment one
@@ -157,6 +158,9 @@ impl<'a> Iterator for MergeReduce<'a> {
                 if p.bounds.is_some() {
                     any_bounded = true;
                 }
+                // Any contributor spanning an unobserved stretch makes the
+                // aggregate one too — same rule `bounds` follows.
+                any_interpolated |= p.interpolated;
                 if !seen_any {
                     shared_edges = p.edges;
                     seen_any = true;
@@ -204,6 +208,7 @@ impl<'a> Iterator for MergeReduce<'a> {
             v,
             bounds,
             edges,
+            interpolated: any_interpolated,
         })
     }
 }
@@ -218,6 +223,7 @@ mod interval_tests {
             v,
             bounds: b,
             edges: None,
+            interpolated: false,
         }))
     }
 

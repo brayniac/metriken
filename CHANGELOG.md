@@ -100,6 +100,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the V2 invariant that the metadata copy cannot disagree with the
   embedded config.
 
+### metriken-query 0.21.1
+
+- **Fixed:** `rate`/`irate` no longer fabricate an acquisition window at a
+  timestamp the producer never read. `interp_window` interpolates a window
+  between the two bracketing samples, which is the right reading when a grid
+  edge merely falls between adjacent reads — but across a HOLE (a counter that
+  was null for a stretch: a device that appears at runtime, a partially
+  populated group, a failed read) it invented a read that never happened, and
+  the band then claimed a precision nobody measured. Such a point now carries
+  its value and no band, flagged by the new `Point::interpolated`. The
+  hole-spanning value itself is unchanged — the total across the hole is known
+  even though its distribution inside it is not.
+- **Added:** `MatrixSample::bands` — the per-value uncertainty band, present
+  when ANY value has one, with `None` at the values that do not.
+  `MatrixSample::intervals` is all-or-nothing by construction and cannot carry
+  a partial set, so on a series with a hole it reports `None`; `bands` is the
+  lossless view. Additive: `intervals` keeps its type and its documented
+  behaviour, and `MatrixSample` is `#[non_exhaustive]` with builder
+  construction, so nothing downstream needs to change to keep compiling.
+- **Added:** `MatrixSample::interpolated` — which values span a stretch the
+  producer did not read, parallel to `values`. This is what a renderer needs to
+  distinguish an interpolated point from a measured one (a desaturated
+  connector, a dashed segment); an uncertainty band cannot express it, because
+  the honest bound on an unobserved interval is not a number. Propagates
+  through scalar ops, aggregation, and series-op-series the way bands do: any
+  operand being interpolated makes the result interpolated.
+
 ### metriken-query 0.18.0
 
 - **Changed:** built against `metriken-exposition` 0.18.0. `Snapshot::V3`
