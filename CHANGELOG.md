@@ -26,6 +26,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### metriken 0.10.1
 
+- **Changed (breaking):** an owned `CounterGroup` entry that has never been
+  written now reads back as `None` rather than `Some(0)`, matching what
+  `GaugeGroup` has always done with its `i64::MIN` sentinel. The value array is
+  allocated whole on first touch, so previously writing *any* index made *every*
+  index report an honest-looking zero — a sampler populating part of its group
+  (one GPU of two, the CPUs it was allowed) published a phantom zero series for
+  the rest, and a consumer could not tell those from real measurements. Owned
+  backing is now filled with a `u64::MAX` sentinel, `add` replaces it rather
+  than wrapping onto it (a compare-exchange loop, as `GaugeGroup::add` already
+  uses), and `value`/`load_with_window` report it as absent. An honest measured
+  zero is still `Some(0)`.
+  **Externally-backed groups are deliberately unaffected**: that memory belongs
+  to the caller and a BPF mmap is kernel zero-filled, so it cannot carry a
+  sentinel — and a zero there is a real starting value, with membership derived
+  from the map's registered entries rather than from value presence. `load()`
+  still returns values raw, sentinel included, to stay index-aligned; use
+  `value()` for a per-entry `Option`. **This needs a 0.11.0 minor bump before
+  release** (`metriken/Cargo.toml`, and the `metriken = "0.10.0"` pin in
+  `metriken-exposition/Cargo.toml`) — it is filed here under the in-progress
+  version rather than bumped unilaterally.
 - **Added:** `with_metadata` on `CounterGroup`, `GaugeGroup`, `HistogramGroup`,
   `WindowedCounterGroup`, and `WindowedGaugeGroup` — runs a closure against
   `Option<&HashMap<String, String>>` while holding the group's metadata read
