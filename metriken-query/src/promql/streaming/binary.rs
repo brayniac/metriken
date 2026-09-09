@@ -358,14 +358,21 @@ impl<'a> Iterator for ZipMergeBinary<'a> {
                         } else {
                             None
                         };
+                        // Either side spanning an unobserved stretch makes the
+                        // combination one too — and drops its band with it.
+                        // `combine_bounds` will happily derive one from the
+                        // operand that HAS a band, treating the other as exact;
+                        // for an operand nobody observed that is a band the
+                        // combination has not earned. The producer's invariant
+                        // is that an interpolated point carries no band, and it
+                        // has to survive the operators or it means nothing.
+                        let interpolated = left.interpolated || right.interpolated;
                         return Some(Point {
                             t: left.t,
                             v,
-                            bounds,
+                            bounds: if interpolated { None } else { bounds },
                             edges,
-                            // Either side spanning an unobserved stretch makes
-                            // the combination one too.
-                            interpolated: left.interpolated || right.interpolated,
+                            interpolated,
                         });
                     }
                 }
@@ -394,12 +401,14 @@ impl<'a> Iterator for RightLookupBinary<'a> {
                 if let Some(v) = self.op.apply(p.v, rv) {
                     let bounds = combine_bounds(self.op, p.v, p.bounds, p.edges, rv, rb, re);
                     let edges = if p.edges == re { p.edges } else { None };
+                    // See the matrix-matrix arm: interpolated drops the band.
+                    let interpolated = p.interpolated || r_interp;
                     return Some(Point {
                         t: p.t,
                         v,
-                        bounds,
+                        bounds: if interpolated { None } else { bounds },
                         edges,
-                        interpolated: p.interpolated || r_interp,
+                        interpolated,
                     });
                 }
             }

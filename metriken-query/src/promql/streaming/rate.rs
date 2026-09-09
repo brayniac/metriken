@@ -463,6 +463,54 @@ mod tests {
         );
     }
 
+    /// The no-band invariant has to survive the operators.
+    ///
+    /// Found by rendering a real chart: `sum(irate(a)) / sum(irate(b))` over a
+    /// series with a hole drew an uncertainty band straight across it, because
+    /// `combine_bounds` derived one from the operand that still had a band and
+    /// treated the unobserved one as exact. The flag alone is not enough — a
+    /// consumer that trusts `bounds` would have shown a confident band over an
+    /// interval nobody watched.
+    #[test]
+    fn combining_with_an_interpolated_operand_drops_the_band() {
+        use crate::promql::streaming::{matrix_matrix_op, BinOp, LabeledSeries, MatchSpec};
+
+        let banded = Point {
+            t: 1,
+            v: 10.0,
+            bounds: Some((9.0, 11.0)),
+            edges: None,
+            interpolated: false,
+        };
+        let hole = Point {
+            t: 1,
+            v: 2.0,
+            bounds: None,
+            edges: None,
+            interpolated: true,
+        };
+
+        let left: Vec<LabeledSeries<'_>> = vec![LabeledSeries::new(
+            Default::default(),
+            std::iter::once(banded),
+        )];
+        let right: Vec<LabeledSeries<'_>> = vec![LabeledSeries::new(
+            Default::default(),
+            std::iter::once(hole),
+        )];
+
+        let out = matrix_matrix_op(left, right, BinOp::Div, MatchSpec::Default);
+        let pts: Vec<Point> = out.into_iter().next().unwrap().iter.collect();
+
+        assert_eq!(pts.len(), 1);
+        assert!(pts[0].interpolated, "the hole taints the combination");
+        assert_eq!(
+            pts[0].bounds, None,
+            "and takes the band with it — a band derived from only the observed \
+             operand claims a precision the result does not have"
+        );
+    }
+
     /// The strict rule must not disturb the ordinary offset-grid case.
     ///
     /// A grid edge landing between two ADJACENT reads is legitimately described

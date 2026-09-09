@@ -188,7 +188,14 @@ impl<'a> Iterator for MergeReduce<'a> {
         // nominal). min/max are declined: which series is the extremum is
         // uncertain, so the nominal can fall outside the true interval. count is
         // exact.
-        let bounds = if any_bounded {
+        //
+        // An aggregate over ANY interpolated contributor is itself
+        // interpolated, and drops its band with it: summing the members that do
+        // have bands would produce one covering only part of what went in,
+        // while presenting as if it covered all of it. The producer's invariant
+        // — an interpolated point carries no band — has to survive the
+        // operators or it means nothing downstream.
+        let bounds = if any_bounded && !any_interpolated {
             match self.op {
                 AggOp::Sum => Some((lo_sum, hi_sum)),
                 AggOp::Avg => Some((lo_sum / count as f64, hi_sum / count as f64)),
