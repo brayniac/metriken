@@ -7,6 +7,22 @@ use super::windows::GroupWindows;
 use crate::{CounterGroupMetric, Metric, Value};
 use metriken_core::Window;
 
+/// Marks an owned entry that has never been written.
+///
+/// `0` cannot serve: it is a legitimate counter value, and a group's value
+/// array is allocated whole on first touch, so without a sentinel every
+/// untouched index in a partially-populated group reads as an honest-looking
+/// zero. `u64::MAX` is reachable only in principle — 584 years at one increment
+/// per nanosecond — and [`GaugeGroup`](crate::GaugeGroup) has always taken the
+/// same trade with `i64::MIN`.
+///
+/// This applies to OWNED backing only. An external backing store is memory the
+/// caller supplies (a BPF mmap, which the kernel zero-fills), so it cannot be
+/// pre-filled with a sentinel and its entries read as `Some(0)` until written.
+/// That is correct for that case: a BPF counter genuinely starts at zero, and
+/// membership there is derived from the map, not from value presence.
+const UNWRITTEN: u64 = u64::MAX;
+
 enum Backing {
     Owned(Vec<AtomicU64>),
     External(&'static [AtomicU64]),
@@ -27,6 +43,13 @@ impl Backing {
 /// (every index from 0..entries has a slot). Metadata is stored sparsely —
 /// only indices with explicitly attached metadata consume memory for it.
 ///
+/// An owned entry that has never been written reads back as `None`, not
+/// `Some(0)` — see [`UNWRITTEN`]. That distinction matters for any group whose
+/// population is smaller than its capacity, or whose members appear at runtime:
+/// without it, every index the sampler never touched publishes a zero that a
+/// consumer cannot tell from a real measurement. An externally-backed group is
+/// the exception; see [`attach_external`](CounterGroup::attach_external).
+///
 /// An external backing store (e.g., a BPF mmap region) can be attached via
 /// [`attach_external`](CounterGroup::attach_external) before any values are
 /// written. This enables zero-copy reads from memory-mapped regions.
@@ -46,6 +69,10 @@ impl Backing {
 ///
 /// assert_eq!(REQUESTS.value(0), Some(1));
 /// assert_eq!(REQUESTS.value(1), Some(5));
+///
+/// // Index 2 was never written. It reads as absent, not as a zero that
+/// // looks like a measurement — even though 0 and 1 have been.
+/// assert_eq!(REQUESTS.value(2), None);
 /// ```
 pub struct CounterGroup {
     values: OnceLock<Backing>,
@@ -80,6 +107,13 @@ impl CounterGroup {
     /// memory-mapped regions (e.g., BPF maps) that live for the process
     /// lifetime.
     ///
+    /// An external store is the caller's memory and is not pre-filled, so the
+    /// [`UNWRITTEN`] sentinel does not apply to it: a kernel-zeroed BPF map
+    /// reads as `Some(0)` from the start. That is the intended reading — such a
+    /// counter genuinely begins at zero, and membership for these groups is
+    /// derived from the map's registered entries rather than from value
+    /// presence.
+    ///
     /// # Safety
     ///
     /// The caller must ensure that the slice remains valid and properly
@@ -94,7 +128,7 @@ impl CounterGroup {
             .get_or_init(|| {
                 let mut v = Vec::with_capacity(self.entries);
                 for _ in 0..self.entries {
-                    v.push(AtomicU64::new(0));
+                    v.push(AtomicU64::new(UNWRITTEN));
                 }
                 Backing::Owned(v)
             })
@@ -111,17 +145,40 @@ impl CounterGroup {
 
     /// Add `value` to the counter at `idx`.
     ///
+    /// If the entry has not been written yet, it is treated as `0` before the
+    /// addition, so the first `add` lands the value itself rather than
+    /// wrapping from the [`UNWRITTEN`] sentinel.
+    ///
     /// Returns `false` if `idx` is out of bounds.
     #[inline]
     pub fn add(&self, idx: usize, value: u64) -> bool {
         if idx >= self.entries {
             return false;
         }
-        self.get_or_init()[idx].fetch_add(value, Ordering::Relaxed);
-        true
+        // A compare-exchange loop rather than `fetch_add`, so the sentinel can
+        // be replaced rather than added to. Owned counter groups are written by
+        // userspace samplers once per entity per refresh; the hot BPF path
+        // writes its mmap in-kernel and never reaches this.
+        let atomic = &self.get_or_init()[idx];
+        let mut current = atomic.load(Ordering::Relaxed);
+        loop {
+            let new = if current == UNWRITTEN {
+                value
+            } else {
+                current.wrapping_add(value)
+            };
+            match atomic.compare_exchange_weak(current, new, Ordering::Relaxed, Ordering::Relaxed) {
+                Ok(_) => return true,
+                Err(actual) => current = actual,
+            }
+        }
     }
 
     /// Set the counter at `idx` to `value`.
+    ///
+    /// Setting [`UNWRITTEN`] (`u64::MAX`) explicitly makes the entry read back
+    /// as never-written; there is no way to distinguish the two, which is the
+    /// cost of a value sentinel.
     ///
     /// Returns `false` if `idx` is out of bounds.
     pub fn set(&self, idx: usize, value: u64) -> bool {
@@ -134,18 +191,25 @@ impl CounterGroup {
 
     /// Load the current value of the counter at `idx`.
     ///
-    /// Returns `None` if `idx` is out of bounds or values haven't been
-    /// initialized.
+    /// Returns `None` if `idx` is out of bounds, values haven't been
+    /// initialized, or the entry has not been written to yet.
     pub fn value(&self, idx: usize) -> Option<u64> {
         if idx >= self.entries {
             return None;
         }
-        self.values
-            .get()
-            .map(|b| b.as_slice()[idx].load(Ordering::Relaxed))
+        self.values.get().and_then(|b| {
+            let v = b.as_slice()[idx].load(Ordering::Relaxed);
+            (v != UNWRITTEN).then_some(v)
+        })
     }
 
     /// Load all counter values as a snapshot.
+    ///
+    /// Values are returned raw: an owned entry that has never been written
+    /// reads as the [`UNWRITTEN`] sentinel rather than being filtered out, so
+    /// the result stays index-aligned with the group. Use
+    /// [`value`](CounterGroup::value) for a per-entry `Option`. Mirrors
+    /// [`GaugeGroup::load`](crate::GaugeGroup::load).
     ///
     /// Returns `None` if the group hasn't been initialized yet.
     pub fn load(&self) -> Option<Vec<u64>> {
@@ -250,16 +314,17 @@ impl CounterGroup {
     /// pair — provided writers use [`set_with_window`](CounterGroup::set_with_window),
     /// not the lock-free `set`/`add`/`increment` (see that method's torn-safety
     /// caveat; the enforced path is [`WindowedCounterGroup`](crate::WindowedCounterGroup)).
-    /// Returns `(None, None)` if `idx` is out of bounds.
+    /// The value is `None` if `idx` is out of bounds or the slot has never been
+    /// written (still the [`UNWRITTEN`] sentinel).
     pub fn load_with_window(&self, idx: usize) -> (Option<u64>, Option<Window>) {
         if idx >= self.entries {
             return (None, None);
         }
         self.windows.with_read(|map| {
-            let value = self
-                .values
-                .get()
-                .map(|b| b.as_slice()[idx].load(Ordering::Relaxed));
+            let value = self.values.get().and_then(|b| {
+                let v = b.as_slice()[idx].load(Ordering::Relaxed);
+                (v != UNWRITTEN).then_some(v)
+            });
             let window = map.and_then(|m| m.get(&idx).copied());
             (value, window)
         })
@@ -568,5 +633,109 @@ mod tests {
         };
         writer.join().unwrap();
         reader.join().unwrap();
+    }
+
+    /// The case the sentinel exists for.
+    ///
+    /// Writing ANY index allocates the whole array, so before this every
+    /// untouched index in the group started reading `Some(0)` — a value a
+    /// consumer cannot tell from a real measurement. A sampler that populates
+    /// part of its group (one GPU of two, the CPUs it was allowed) published a
+    /// phantom zero series for the rest.
+    #[test]
+    fn an_untouched_entry_stays_absent_after_a_sibling_is_written() {
+        static GROUP: CounterGroup = CounterGroup::new(4);
+
+        assert_eq!(GROUP.value(1), None, "nothing written yet");
+
+        GROUP.add(0, 7);
+
+        assert_eq!(GROUP.value(0), Some(7));
+        assert_eq!(GROUP.value(1), None, "allocation is not population");
+        assert_eq!(GROUP.value(2), None);
+        assert_eq!(GROUP.value(3), None);
+    }
+
+    /// A zero that was actually measured is still reported.
+    ///
+    /// The sentinel distinguishes "never written" from "written, and zero" —
+    /// it does not suppress honest zeros.
+    #[test]
+    fn a_written_zero_is_not_mistaken_for_absent() {
+        static GROUP: CounterGroup = CounterGroup::new(2);
+
+        GROUP.set(0, 0);
+        GROUP.add(1, 0);
+
+        assert_eq!(GROUP.value(0), Some(0), "set(0) is a measurement");
+        assert_eq!(GROUP.value(1), Some(0), "add(0) is a measurement");
+    }
+
+    /// The first `add` must replace the sentinel, not add to it.
+    ///
+    /// `fetch_add` would wrap `u64::MAX + 5` to 4 — off by one and silent.
+    #[test]
+    fn the_first_add_lands_the_value_rather_than_wrapping() {
+        static GROUP: CounterGroup = CounterGroup::new(1);
+
+        GROUP.add(0, 5);
+        assert_eq!(GROUP.value(0), Some(5));
+
+        GROUP.add(0, 5);
+        assert_eq!(GROUP.value(0), Some(10), "subsequent adds accumulate");
+    }
+
+    /// Externally-backed groups keep the old reading, deliberately.
+    ///
+    /// The caller supplies that memory — for a BPF map the kernel zero-fills it
+    /// — so it cannot carry a sentinel, and a zero there is a real starting
+    /// value rather than an absence.
+    #[test]
+    fn external_backing_reads_zero_as_a_value_not_an_absence() {
+        static EXTERNAL: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(9)];
+        static GROUP: CounterGroup = CounterGroup::new(2);
+
+        unsafe {
+            GROUP.attach_external(&EXTERNAL);
+        }
+
+        assert_eq!(GROUP.value(0), Some(0), "kernel-zeroed, not absent");
+        assert_eq!(GROUP.value(1), Some(9));
+
+        // And an add onto a zeroed external entry accumulates from 0, since
+        // the sentinel is not present to be replaced.
+        GROUP.add(0, 3);
+        assert_eq!(GROUP.value(0), Some(3));
+    }
+
+    /// `load()` stays index-aligned, so it returns the sentinel raw.
+    #[test]
+    fn load_returns_the_sentinel_rather_than_dropping_the_entry() {
+        static GROUP: CounterGroup = CounterGroup::new(3);
+
+        GROUP.set(0, 10);
+        GROUP.set(2, 30);
+
+        let snap = GROUP.load().unwrap();
+        assert_eq!(snap, vec![10, UNWRITTEN, 30]);
+        assert_eq!(GROUP.value(1), None, "but value() reports it as absent");
+    }
+
+    /// The windowed read applies the same rule as `value`.
+    #[test]
+    fn load_with_window_reports_an_unwritten_entry_as_absent() {
+        use metriken_core::Window;
+
+        static GROUP: CounterGroup = CounterGroup::new(2);
+
+        GROUP.set_with_window(0, 42, Window::new(1, 2));
+
+        let (v, w) = GROUP.load_with_window(0);
+        assert_eq!(v, Some(42));
+        assert!(w.is_some());
+
+        let (v, w) = GROUP.load_with_window(1);
+        assert_eq!(v, None, "allocated by the sibling write, never populated");
+        assert!(w.is_none());
     }
 }
