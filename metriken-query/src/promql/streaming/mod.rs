@@ -96,6 +96,24 @@ pub struct Point {
     /// windows. `None` for every other producer — and for aggregated points,
     /// which no longer correspond to a single read.
     pub(crate) edges: Option<RateEdges>,
+    /// This point's interval is not bounded by real acquisitions at both ends:
+    /// its value is interpolated across a span in which the producer did not
+    /// read.
+    ///
+    /// A counter that is null for a stretch — a device that appears at runtime,
+    /// a partially-populated group, a read that failed — leaves a hole that
+    /// `rate`/`irate` still span, because the total across the hole is known
+    /// even though its distribution inside is not. Such a point carries a
+    /// value, and no `bounds`: an uncertainty band answers "how precisely do we
+    /// know the average over THIS interval", and for an interval nobody
+    /// observed the honest answer is unbounded, not a number. This flag is what
+    /// says so, and it is what lets a consumer render the difference (a
+    /// desaturated connector, a dashed segment) rather than showing an
+    /// interpolated point as though it had been measured.
+    ///
+    /// Propagates through operators the way `bounds` does: any operand being
+    /// interpolated makes the result interpolated.
+    pub interpolated: bool,
 }
 impl Point {
     /// A point with no uncertainty bound (the default for every producer/operator
@@ -106,6 +124,7 @@ impl Point {
             v,
             bounds: None,
             edges: None,
+            interpolated: false,
         }
     }
 }
@@ -138,24 +157,38 @@ pub fn collect_to_matrix(streaming: SeriesSet<'_>, metric_name: Option<&str>) ->
         .into_iter()
         .filter_map(|ls| {
             #[allow(clippy::type_complexity)]
-            let points: Vec<((f64, f64), Option<(f64, f64)>)> = ls
+            let points: Vec<((f64, f64), Option<(f64, f64)>, bool)> = ls
                 .iter
-                .map(|p| ((p.t as f64 / 1e9, p.v), p.bounds))
+                .map(|p| ((p.t as f64 / 1e9, p.v), p.bounds, p.interpolated))
                 .collect();
             if points.is_empty() {
                 return None;
             }
-            let values: Vec<(f64, f64)> = points.iter().map(|(v, _)| *v).collect();
+            let values: Vec<(f64, f64)> = points.iter().map(|(v, _, _)| *v).collect();
             // Emit intervals only when every point carries a band; else None.
             // Bands originate at rate()/irate() (and histogram value bands) and
             // propagate through scalar ops, sum/avg aggregation, and
             // series-op-series binary ops — but an unsupported operator upstream
             // (e.g. min/max) drops them, making the series non-uniform.
-            let intervals: Option<Vec<(f64, f64)>> = if points.iter().all(|(_, b)| b.is_some()) {
-                Some(points.iter().map(|(_, b)| b.unwrap()).collect())
+            //
+            // This field's all-or-nothing rule is kept as it was, for consumers
+            // that predate `bands`. It is lossy for a series where only some
+            // points carry a band — which is what `bands` below is for.
+            let intervals: Option<Vec<(f64, f64)>> = if points.iter().all(|(_, b, _)| b.is_some()) {
+                Some(points.iter().map(|(_, b, _)| b.unwrap()).collect())
             } else {
                 None
             };
+            // The lossless form: present when ANY point has a band, `None` at
+            // the points that do not.
+            let bands: Option<Vec<Option<(f64, f64)>>> = points
+                .iter()
+                .any(|(_, b, _)| b.is_some())
+                .then(|| points.iter().map(|(_, b, _)| *b).collect());
+            let interpolated: Option<Vec<bool>> = points
+                .iter()
+                .any(|(_, _, i)| *i)
+                .then(|| points.iter().map(|(_, _, i)| *i).collect());
             let mut metric: HashMap<String, String> = HashMap::new();
             if let Some(name) = metric_name {
                 metric.insert("__name__".to_string(), name.to_string());
@@ -163,11 +196,12 @@ pub fn collect_to_matrix(streaming: SeriesSet<'_>, metric_name: Option<&str>) ->
             for (k, v) in ls.labels.inner.iter() {
                 metric.insert(k.clone(), v.clone());
             }
-            Some(MatrixSample {
-                metric,
-                values,
-                intervals,
-            })
+            Some(
+                MatrixSample::new(metric, values)
+                    .with_intervals(intervals)
+                    .with_bands(bands)
+                    .with_interpolated(interpolated),
+            )
         })
         .collect()
 }

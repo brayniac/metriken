@@ -362,11 +362,17 @@ fn quantiles_impl(
         let mut metric: HashMap<String, String> = HashMap::new();
         metric.insert("__name__".to_string(), metric_name.to_string());
         metric.insert("quantile".to_string(), q.to_string());
-        samples.push(MatrixSample {
-            metric,
-            values,
-            intervals,
-        });
+        // Histogram quantiles carry a bucket band at every point or none, so
+        // `bands` mirrors `intervals` here; there is no interpolation across a
+        // hole for this producer.
+        let bands = intervals
+            .as_ref()
+            .map(|iv| iv.iter().copied().map(Some).collect());
+        samples.push(
+            MatrixSample::new(metric, values)
+                .with_intervals(intervals)
+                .with_bands(bands),
+        );
     }
     samples
 }
@@ -914,11 +920,17 @@ fn build_grouped_output(
         for (k, v) in key.inner {
             metric.insert(k, v);
         }
-        samples.push(MatrixSample {
-            metric,
-            values,
-            intervals,
-        });
+        // Histogram quantiles carry a bucket band at every point or none, so
+        // `bands` mirrors `intervals` here; there is no interpolation across a
+        // hole for this producer.
+        let bands = intervals
+            .as_ref()
+            .map(|iv| iv.iter().copied().map(Some).collect());
+        samples.push(
+            MatrixSample::new(metric, values)
+                .with_intervals(intervals)
+                .with_bands(bands),
+        );
     }
     samples
 }

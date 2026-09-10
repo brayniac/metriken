@@ -70,8 +70,30 @@ impl Sample {
 pub struct MatrixSample {
     pub metric: HashMap<String, String>,
     pub values: Vec<(f64, f64)>, // Vec of (timestamp_seconds, value)
+    /// Per-value uncertainty band, present only when EVERY value has one.
+    ///
+    /// Kept at its original type and semantics for consumers that predate
+    /// [`bands`](Self::bands); a series where only some points carry a band
+    /// reports `None` here and the full picture in `bands`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub intervals: Option<Vec<(f64, f64)>>,
+    /// Per-value uncertainty band, present when ANY value has one, with `None`
+    /// at the values that do not.
+    ///
+    /// A band is absent at a point whose interval nobody observed — see
+    /// [`interpolated`](Self::interpolated). `intervals` cannot express that
+    /// (one missing band drops the whole array), which is why this exists.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bands: Option<Vec<Option<(f64, f64)>>>,
+    /// Which values are interpolated across a span the producer did not read,
+    /// parallel to `values`. Present when any value is.
+    ///
+    /// Such a point still carries a value — the total across the hole is known
+    /// even though its distribution inside is not — but no band, since the
+    /// honest bound on an unobserved interval is not a number. Renderers use
+    /// this to distinguish an interpolated point from a measured one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interpolated: Option<Vec<bool>>,
 }
 
 impl MatrixSample {
@@ -82,12 +104,28 @@ impl MatrixSample {
             metric,
             values,
             intervals: None,
+            bands: None,
+            interpolated: None,
         }
     }
 
     /// Attach (or clear) the per-value uncertainty band, parallel to `values`.
     pub fn with_intervals(mut self, intervals: Option<Vec<(f64, f64)>>) -> Self {
         self.intervals = intervals;
+        self
+    }
+
+    /// Attach (or clear) the per-value bands, parallel to `values`, where a
+    /// `None` entry marks a value with no band.
+    pub fn with_bands(mut self, bands: Option<Vec<Option<(f64, f64)>>>) -> Self {
+        self.bands = bands;
+        self
+    }
+
+    /// Attach (or clear) the per-value interpolated markers, parallel to
+    /// `values`.
+    pub fn with_interpolated(mut self, interpolated: Option<Vec<bool>>) -> Self {
+        self.interpolated = interpolated;
         self
     }
 }

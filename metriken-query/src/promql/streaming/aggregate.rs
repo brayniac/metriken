@@ -132,6 +132,7 @@ impl<'a> Iterator for MergeReduce<'a> {
         // Interval arithmetic for sum/avg: a windowless child contributes its
         // point value as a degenerate band [v, v].
         let mut any_bounded = false;
+        let mut any_interpolated = false;
         let (mut lo_sum, mut hi_sum) = (0.0f64, 0.0f64);
         // Unanimity tracking for the acquisition edges: `Some(e)` while every
         // contributor so far carried exactly `e`, `None` the moment one
@@ -157,6 +158,9 @@ impl<'a> Iterator for MergeReduce<'a> {
                 if p.bounds.is_some() {
                     any_bounded = true;
                 }
+                // Any contributor spanning an unobserved stretch makes the
+                // aggregate one too — same rule `bounds` follows.
+                any_interpolated |= p.interpolated;
                 if !seen_any {
                     shared_edges = p.edges;
                     seen_any = true;
@@ -184,7 +188,14 @@ impl<'a> Iterator for MergeReduce<'a> {
         // nominal). min/max are declined: which series is the extremum is
         // uncertain, so the nominal can fall outside the true interval. count is
         // exact.
-        let bounds = if any_bounded {
+        //
+        // An aggregate over ANY interpolated contributor is itself
+        // interpolated, and drops its band with it: summing the members that do
+        // have bands would produce one covering only part of what went in,
+        // while presenting as if it covered all of it. The producer's invariant
+        // — an interpolated point carries no band — has to survive the
+        // operators or it means nothing downstream.
+        let bounds = if any_bounded && !any_interpolated {
             match self.op {
                 AggOp::Sum => Some((lo_sum, hi_sum)),
                 AggOp::Avg => Some((lo_sum / count as f64, hi_sum / count as f64)),
@@ -204,6 +215,7 @@ impl<'a> Iterator for MergeReduce<'a> {
             v,
             bounds,
             edges,
+            interpolated: any_interpolated,
         })
     }
 }
@@ -218,6 +230,7 @@ mod interval_tests {
             v,
             bounds: b,
             edges: None,
+            interpolated: false,
         }))
     }
 
