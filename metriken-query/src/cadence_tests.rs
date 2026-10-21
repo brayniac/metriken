@@ -7,10 +7,12 @@
 //!
 //! The bounds under test take the spacing of the samples near each point
 //! (`promql::streaming::spacing`), and the reach, a gauge's hold and a raw
-//! pair's gap are capped at what the source's interval hint gives. So at a
-//! hint as coarse as the rows everything is exact, and at a finer hint those
-//! three are still the hint's
-//! ([`a_hint_finer_than_the_rows_still_bounds_reach_hold_and_gap`]). Design
+//! pair's gap are capped at what the source's interval hint gives. An
+//! archive table's hint is at least the longest row gap its segments record
+//! over the query's window, so through an archive everything is exact whatever its
+//! probed interval; a `MemoryStore` declaring an interval finer than its rows
+//! is still held to it
+//! ([`a_store_declaring_a_finer_interval_than_its_rows_is_held_to_it`]). Design
 //! and measurement: `docs/journal/2026-10-19-recording-identity-and-views.md`,
 //! rules S10–S12.
 
@@ -117,6 +119,13 @@ fn field(name: &str, kind: &str, dt: DataType) -> Field {
 /// One group table holding `c`, `c2` and `g` with a table-level window
 /// pair, declaring `sampling_interval_ms` when `declared_ms` is set.
 fn segment(ts: &[u64], declared_ms: Option<u64>) -> Vec<u8> {
+    segment_with(ts, declared_ms, None)
+}
+
+/// [`segment`] whose footer records `spacing` under
+/// `metriken_storage::spacing::FOOTER_KEY`, as a segment the archive writer
+/// sealed does; [`segment`]'s records none, as one sealed before the key.
+fn segment_with(ts: &[u64], declared_ms: Option<u64>, spacing: Option<String>) -> Vec<u8> {
     let schema = Arc::new(Schema::new(vec![
         Field::new("timestamp", DataType::UInt64, false),
         Field::new(":window_begin", DataType::Int64, true),
@@ -140,13 +149,13 @@ fn segment(ts: &[u64], declared_ms: Option<u64>) -> Vec<u8> {
             ts.iter().map(|&t| g_of(t)).collect::<Vec<_>>(),
         )),
     ];
+    let mut kv: Vec<KeyValue> = declared_ms
+        .map(|ms| KeyValue::new("sampling_interval_ms".to_string(), ms.to_string()))
+        .into_iter()
+        .collect();
+    kv.extend(spacing.map(|v| KeyValue::new(metriken_storage::spacing::FOOTER_KEY.to_string(), v)));
     let props = WriterProperties::builder()
-        .set_key_value_metadata(declared_ms.map(|ms| {
-            vec![KeyValue {
-                key: "sampling_interval_ms".to_string(),
-                value: Some(ms.to_string()),
-            }]
-        }))
+        .set_key_value_metadata((!kv.is_empty()).then_some(kv))
         .build();
     let mut buf = Vec::new();
     let mut w = ArrowWriter::try_new(&mut buf, schema.clone(), Some(props)).unwrap();
@@ -216,18 +225,26 @@ fn coarse_hint_sources(ts: &[u64]) -> Vec<(String, Box<dyn MetricsSource>)> {
     out
 }
 
-/// The sources whose hint is finer than the coarse rows: a `MemoryStore`
-/// declaring 100 ms, an archive table whose hint is the median gap of its
-/// one segment (100 ms), and one declaring 250 ms (what a catalog's span
-/// over gaps gives for the coarse-fine-coarse rows); and, for rows that
-/// start fine, three segments whose first is fine.
-fn fine_hint_sources(ts: &[u64]) -> Vec<(String, Box<dyn MetricsSource>)> {
+/// The archive sources whose probed interval is finer than the coarse rows:
+/// one segment, whose median gap is 100 ms, with its footer recording its
+/// spacing (as the writer seals it), recording none (as a segment sealed
+/// before the key, measured when a query reads it), and recording a version
+/// this reader does not read (measured too); one declaring 250 ms (what a
+/// catalog's span over gaps gives for the coarse-fine-coarse rows); and, for
+/// rows that start fine, three segments whose first is fine.
+fn fine_hint_archives(ts: &[u64]) -> Vec<(String, Box<dyn MetricsSource>)> {
+    let recorded =
+        metriken_storage::spacing::encode_spacing(metriken_storage::spacing::segment_spacing(ts));
+    let one = |spacing: Option<String>| -> Box<dyn MetricsSource> {
+        Box::new(archive(vec![(
+            "s/grp",
+            vec![segment_with(ts, None, spacing)],
+        )]))
+    };
     let mut out: Vec<(String, Box<dyn MetricsSource>)> = vec![
-        ("mem 100ms".into(), Box::new(store(ts, 100))),
-        (
-            "archive median".into(),
-            Box::new(archive(vec![("s/grp", vec![segment(ts, None)])])),
-        ),
+        ("archive median recorded".into(), one(Some(recorded))),
+        ("archive median".into(), one(None)),
+        ("archive median v2".into(), one(Some("2:1,2,3,4".into()))),
         (
             "archive 250ms".into(),
             Box::new(archive(vec![("s/grp", vec![segment(ts, Some(250))])])),
@@ -236,6 +253,14 @@ fn fine_hint_sources(ts: &[u64]) -> Vec<(String, Box<dyn MetricsSource>)> {
     if ts[1] - ts[0] < S {
         out.push(("archive 3 segments".into(), Box::new(three_segments(ts))));
     }
+    out
+}
+
+/// Every source above: those whose hint is the coarse interval, and the
+/// archives whose probed interval is finer.
+fn exact_sources(ts: &[u64]) -> Vec<(String, Box<dyn MetricsSource>)> {
+    let mut out = coarse_hint_sources(ts);
+    out.extend(fine_hint_archives(ts));
     out
 }
 
@@ -437,37 +462,42 @@ const RATES: [&str; 5] = [
     "rate(c2[60s])",
 ];
 
-/// S10: at the coarse hint, rate values exact, every grid point present,
-/// and a band containing the truth on every point. Upstream, rows that
-/// start fine lost the band on every point of the coarse span: the hole
-/// test took the median of the first nine samples.
+/// S10: rate values exact, every grid point present, and a band containing
+/// the truth on every point, at the coarse hint and through archives whose
+/// probed interval is the fine 100 ms or 250 ms: there a table's interval
+/// is at least the longest row gap its segments record (or, without the record,
+/// measure). Upstream, rows that start fine lost the band on every point of
+/// the coarse span, and at a fine probed interval a `rate` window starting
+/// in a coarse span started late (70 of 140 points wrong near the change,
+/// 4.9%).
 #[test]
-fn rates_are_exact_and_banded_at_a_coarse_hint() {
+fn rates_are_exact_and_banded_at_any_archive_hint() {
     let mut report = Report::new("rate");
-    rate_suite(&mut report, coarse_hint_sources, &RATES);
+    rate_suite(&mut report, exact_sources, &RATES);
     report.assert();
 }
 
-/// S10: at a hint finer than the rows, `irate` is exact and banded
-/// everywhere, and so is a `rate` of a constant-rate counter.
+/// S10: a `MemoryStore` declaring 100 ms over these rows: `irate` and a
+/// constant-rate `rate` are exact and banded everywhere.
 #[test]
-fn irate_is_exact_and_banded_at_a_fine_hint() {
+fn irate_is_exact_and_banded_at_a_declared_fine_interval() {
     let mut report = Report::new("rate");
     rate_suite(
         &mut report,
-        fine_hint_sources,
+        |ts| vec![("mem 100ms".into(), Box::new(store(ts, 100)) as Box<_>)],
         &["irate(c[5s])", "irate(c2[5s])", "rate(c[10s])"],
     );
     report.assert();
 }
 
-/// S10: at the coarse hint a gauge is held to the next row at every grid
-/// point.
+/// S10: a gauge is held to the next row at every grid point. Upstream, at a
+/// fine probed interval, it dropped every point more than 100 ms past a
+/// coarse row (800 of 1601 at a 100 ms step).
 #[test]
-fn a_gauge_keeps_every_point_at_a_coarse_hint() {
+fn a_gauge_keeps_every_point_at_any_archive_hint() {
     let mut report = Report::new("gauge");
     for (fixture, ts) in fixtures() {
-        for (name, src) in coarse_hint_sources(&ts) {
+        for (name, src) in exact_sources(&ts) {
             for step in [1.0, 0.1] {
                 let points = run(src.as_ref(), "g", step, &QueryOptions::default());
                 let latest = |t: u64| g_of(ts[ts.partition_point(|&x| x <= t) - 1]) as f64;
@@ -489,12 +519,13 @@ fn rows_in_range(ts: &[u64]) -> Vec<u64> {
         .collect()
 }
 
-/// S10: at the coarse hint raw `irate` gives the rate at every row.
+/// S10: raw `irate` gives the rate at every row. Upstream, at a 100 ms
+/// probed interval, it gave no value for any 1 s pair.
 #[test]
-fn raw_irate_gives_every_pair_at_a_coarse_hint() {
+fn raw_irate_gives_every_pair_at_any_archive_hint() {
     let mut report = Report::new("raw");
     for (fixture, ts) in fixtures() {
-        for (name, src) in coarse_hint_sources(&ts) {
+        for (name, src) in exact_sources(&ts) {
             let points = run(
                 src.as_ref(),
                 "irate(c[5s])",
@@ -601,8 +632,8 @@ type Bits = (u64, u64, Option<(u64, u64)>);
 #[test]
 fn rates_through_a_change_of_spacing_are_the_same_from_any_start() {
     for (fixture, ts) in fixtures() {
-        let mut sources = coarse_hint_sources(&ts);
-        sources.extend(fine_hint_sources(&ts));
+        let mut sources = exact_sources(&ts);
+        sources.push(("mem 100ms".into(), Box::new(store(&ts, 100))));
         for (name, src) in sources {
             for per_series in [false, true] {
                 let opts = QueryOptions::default().with_per_series_rates(per_series);
@@ -642,38 +673,30 @@ fn rates_through_a_change_of_spacing_are_the_same_from_any_start() {
     }
 }
 
-/// What this does not fix: at a hint finer than the rows, a `rate`'s
-/// reach, a gauge's hold and a raw pair's gap are still at most the hint's
-/// (two, one and four of it), because a read starts only that far before a
-/// range. A `rate(c2[r])` whose window starts in a coarse span starts it at
-/// the first row after its left edge, a gauge drops the points more than the
-/// hint past a coarse row, and raw `irate` gives no value for a 1 s pair.
-/// Fixing them needs a read that reaches as far back as the rows are apart.
+/// What this does not fix: a `MemoryStore` that declares an interval finer
+/// than its rows (built at 100 ms, holding 1 s rows) has no segments to
+/// record their spacing, and its declared interval still bounds a `rate`'s
+/// reach, a gauge's hold and a raw pair's gap (two, one and four of it),
+/// because its reads start that far before a range. A `rate(c2[r])` whose
+/// window starts in a coarse span starts it at the first row after its left
+/// edge, a gauge drops the points more than 100 ms past a coarse row, and
+/// raw `irate` gives no value for a 1 s pair.
 #[test]
-fn a_hint_finer_than_the_rows_still_bounds_reach_hold_and_gap() {
+fn a_store_declaring_a_finer_interval_than_its_rows_is_held_to_it() {
     for (fixture, ts) in fixtures() {
-        for (name, src) in fine_hint_sources(&ts) {
-            let rate = run(src.as_ref(), "rate(c2[10s])", 0.1, &QueryOptions::default());
-            let m = score(&rate, &grid(0.1), &rate_truth(c_step, 10), 1e-6, false);
-            assert!(m.missing == 0 && m.wrong > 0, "{fixture} {name}: {m:?}");
-
-            let g = run(src.as_ref(), "g", 0.1, &QueryOptions::default());
-            assert!(g.len() < grid(0.1).len(), "{fixture} {name}");
-
-            let raw = run(
-                src.as_ref(),
-                "irate(c[5s])",
-                1.0,
-                &QueryOptions::with_rate_mode(RateMode::Raw),
-            );
-            // Four of a 250 ms hint is the coarse rows' 1 s.
-            let rows = rows_in_range(&ts);
-            assert_eq!(
-                raw.len() < rows.len(),
-                name != "archive 250ms",
-                "{fixture} {name}"
-            );
-        }
+        let src = store(&ts, 100);
+        let rate = run(&src, "rate(c2[10s])", 0.1, &QueryOptions::default());
+        let m = score(&rate, &grid(0.1), &rate_truth(c_step, 10), 1e-6, false);
+        assert!(m.missing == 0 && m.wrong > 0, "{fixture}: {m:?}");
+        let g = run(&src, "g", 0.1, &QueryOptions::default());
+        assert!(g.len() < grid(0.1).len(), "{fixture}");
+        let raw = run(
+            &src,
+            "irate(c[5s])",
+            1.0,
+            &QueryOptions::with_rate_mode(RateMode::Raw),
+        );
+        assert!(raw.len() < rows_in_range(&ts).len(), "{fixture}");
     }
 }
 

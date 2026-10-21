@@ -20,15 +20,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A `rate`'s reach (how far before a window's left edge a sample is
   interpolated from), a gauge's hold past its latest sample and the longest
   pair raw `irate` gives a value for are two, one and four of the spacing of
-  the samples around the point, and at most what they were: two intervals,
-  the step or the interval, and four intervals. Inside a 100 ms span of a
+  the samples around the point, and at most two intervals, the step or the
+  interval, and four intervals. Over an `ArchiveReader` a table's interval
+  is the larger of its probed one and the longest gap between rows its
+  segments record over the query's range (`SamplerReader::spacing_over`). A table
+  probed at 100 ms (the median of its first rows, or a catalog's mean gap)
+  that later reads every 1 s is now exact: upstream, at a 100 ms step, a
+  `rate(x[10s])` window starting in the 1 s span started late (70 of 140
+  points wrong near the change, 4.9%), the gauge dropped 800 of 1601 points
+  and raw `irate` gave no value for any 1 s pair. Inside a 100 ms span of a
   table whose interval is 1 s, a gauge is no longer held a second past a
   missing row, raw `irate` gives no value across a 1 s gap, and a `rate`
-  window starting in such a gap starts at the row after it. Where a series'
-  rows are further apart than its interval (a table probed at 100 ms that
-  later reads every 1 s) the three are the interval's, as before: a read
-  starts that far before the range, and a longer bound would make a result
-  depend on where the range starts.
+  window starting in such a gap starts at the row after it. A source whose
+  interval is finer than its rows and that records no spacing (a
+  `MemoryStore` built at 100 ms over 1 s rows) is held to the interval, as
+  before: its reads start that far before the range, and a longer bound
+  would make a result depend on where the range starts.
 - Over an `ArchiveReader`, a query across samplers of different cadence is
   evaluated at the slow sampler's rows only in the spans where the cadences
   differ, and on the step's grid elsewhere, and `eval_timestamps_for`
@@ -42,20 +49,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   in Prometheus, and an unstrided histogram function gives one point per row
   and ignores the step; over a source whose spacing changes, a chart uses
   the strided form with the stride at its step.
-- Measured on a 9.6 h archive (1 s rows, full range, step 1 s): the batched
-  `rate(x[1m])` path is 16% slower, batched `irate` 7%, raw `irate` 16%;
-  per-series `irate` takes the same time and per-series `rate` 12% less.
-- Needs metriken-storage 0.4.1 (`spacing`).
+- Measured on a 9.6 h archive (1 s rows, full range, step 1 s, four
+  interleaved rounds of five runs, upstream's own spread 2% to 5%): the
+  batched `rate(x[1m])` path is 9% slower, batched `irate` 2%, raw `irate`
+  8%; per-series `irate` is 6% faster and per-series `rate` 20%. A 600 s
+  range at a 0.1 s step is 15% slower for `irate` and 29% (40 µs) for a
+  gauge. An archive written before segments recorded their spacing measures
+  each segment a query reaches once, from its timestamps: about 10 ms more on
+  the first query of a 1 s table over 9.6 h.
+- Needs metriken-storage 0.4.1 (`spacing`, `SamplerReader::spacing_over`).
 
 ### metriken-storage 0.4.1
 
-- Added `spacing`: the spacing of a series' rows near a pair of them (the
-  larger of the median of up to eight gaps before the pair and the median of
-  up to eight after it), `spacing_at_least`, which compares it with a value
-  without sorting, `pair_spacings`, the spacing of every pair of a table's
-  rows with holes marked, and `spacing_range`, the finest and coarsest of
-  those. `SamplerReader::spacing_range` answers the last for a table, from
-  its row timestamps, once.
+- Every segment records the shortest and longest gap between its rows in
+  its footer under `metriken.spacing` (`spacing::FOOTER_KEY`), as
+  `1:<min>,<max>`. The builders (`TableBuilder`, `GroupTableBuilder`,
+  `LongTableBuilder`) keep them as rows are appended (`spacing::RowGaps`: one
+  subtraction and two comparisons per row, measured at 1 ns a row against
+  5 to 112 µs a row to materialize the segment), so a seal, a WAL tail a
+  reader materializes and a `.rez` segment all carry them;
+  `write_table_parquet_with` folds them over the stamps of a table it is
+  given without them. A reader that predates the key ignores it, as it does
+  any footer key it does not know. It adds 38 bytes to a footer. The record
+  is not in the segment index: a reader up to this one takes a segment whose
+  index is not the 12-byte names fingerprint to hold the first segment's
+  names, so a longer record would hide metric names that first appear in a
+  later segment.
+- Added `SegmentedSource::spacing_over` and `SamplerReader::spacing_over`:
+  the row spacing of a table's segments over a range, from their footers. A
+  segment sealed before the key is measured from its timestamps the first
+  time a range reaches it, and the measurement kept for the reader's life;
+  that decodes its `timestamp` column once (a long segment's holds a row per
+  occupant).
+- Added the `spacing` module: the spacing of a pair of rows (the larger of
+  the median of up to eight gaps before the pair and the median of up to
+  eight after it), `spacing_at_least`, which compares it with a value
+  without sorting, `pair_spacings`, and the per-segment `SegmentSpacing`,
+  `RowGaps` and the footer encoding. `TableBuilder::row_gaps` and
+  `GroupTableBuilder::row_gaps` report what a builder has kept.
+- A table's merged file metadata leaves the spacing key out: it describes
+  one segment.
+- `DataSource::gauge_parts`'s documentation says how long the engine holds a
+  gauge (the step, or the spacing around the point when longer, at most the
+  interval).
 
 ### metriken-storage 0.4.0
 

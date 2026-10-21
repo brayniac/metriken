@@ -74,6 +74,8 @@ pub struct LongTableBuilder {
     occupants: Vec<u64>,
     order: Vec<String>,
     columns: HashMap<String, LongColumn>,
+    /// The gaps of the ticks pushed, for the segment's footer.
+    gaps: crate::spacing::RowGaps,
 }
 
 impl Default for LongTableBuilder {
@@ -91,6 +93,7 @@ impl LongTableBuilder {
             occupants: Vec::new(),
             order: Vec::new(),
             columns: HashMap::new(),
+            gaps: Default::default(),
         }
     }
 
@@ -138,6 +141,7 @@ impl LongTableBuilder {
         schema: &GroupSchema,
         occupants: &[LongOccupant],
     ) {
+        self.gaps.push(ts);
         for occ in occupants {
             let row = self.timestamps.len();
             self.timestamps.push(ts);
@@ -192,6 +196,7 @@ impl LongTableBuilder {
         props: parquet::file::properties::WriterProperties,
     ) -> Result<Vec<u8>, crate::table::Error> {
         let rows = self.timestamps.len();
+        let props = crate::spacing::with_footer(props, self.gaps.spacing());
         for name in &self.order {
             self.columns.get_mut(name).expect("ordered").pad(rows);
         }
@@ -282,10 +287,14 @@ impl LongTableBuilder {
                 kv.push(KeyValue::new(column_occupants_key(&col.field_name()), has));
             }
         }
+        // After whatever the caller's properties carry (a segment's spacing).
+        let mut all_kv = props.key_value_metadata().cloned().unwrap_or_default();
+        all_kv.retain(|e| !kv.iter().any(|k| k.key == e.key));
+        all_kv.extend(kv);
         let props = crate::format::stamped(
             props
                 .into_builder()
-                .set_key_value_metadata(Some(kv))
+                .set_key_value_metadata(Some(all_kv))
                 .build(),
         );
         let mut buf = Vec::new();

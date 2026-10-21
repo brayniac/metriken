@@ -104,8 +104,10 @@ pub use union::UnionMetricsSource;
 /// to two of the spacing of the samples around `t − r` before it, and at
 /// most two of the series' interval: its table's, where the source sets it
 /// on the series (`LabeledSource::with_interval`, as an archive does for
-/// each table), else the source's `DataSource::counter_interval`. The spacing of two consecutive
-/// samples is the larger of the median of up to eight gaps before them and
+/// each table, at least the longest gap between rows its segments record
+/// over the query's range), else the source's
+/// `DataSource::counter_interval`. The spacing of two consecutive samples is
+/// the larger of the median of up to eight gaps before them and
 /// the median of up to eight after (`metriken_storage::spacing`), so a
 /// series whose spacing changes (1 s rows, then 100 ms rows) is read at the
 /// spacing where each point is. Where the series has no sample that close

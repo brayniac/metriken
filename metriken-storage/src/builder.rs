@@ -101,6 +101,8 @@ pub struct TableBuilder {
     /// A writer's dedup state (see [`last_key`](Self::last_key)).
     last_key: Option<u64>,
     approx_bytes: usize,
+    /// The gaps of the rows pushed, for the segment's footer.
+    gaps: crate::spacing::RowGaps,
 }
 
 impl TableBuilder {
@@ -113,7 +115,14 @@ impl TableBuilder {
             columns: HashMap::new(),
             last_key: None,
             approx_bytes: 0,
+            gaps: Default::default(),
         }
+    }
+
+    /// The shortest and longest gap of the rows pushed so far, which the
+    /// segment's footer records (`crate::spacing::FOOTER_KEY`).
+    pub fn row_gaps(&self) -> Option<crate::spacing::SegmentSpacing> {
+        self.gaps.spacing()
     }
 
     /// Approximate in-memory bytes accumulated by the cells pushed so far.
@@ -185,6 +194,7 @@ impl TableBuilder {
     pub fn push_row(&mut self, snapshot_ts: u64, wall_offset_ns: i64, cells: &[Cell<'_>]) {
         let row = self.timestamps.len();
         self.timestamps.push(snapshot_ts);
+        self.gaps.push(snapshot_ts);
         self.wall_offsets.push(wall_offset_ns);
         let mut added_bytes = 0usize;
         for e in cells {
@@ -342,6 +352,8 @@ pub struct GroupTableBuilder {
     /// reported. A malformed cell usually repeats every tick, so without this
     /// one bad member would log per row for the life of the segment.
     reported_bad_histograms: HashSet<String>,
+    /// The gaps of the rows pushed, for the segment's footer.
+    gaps: crate::spacing::RowGaps,
 }
 
 impl GroupTableBuilder {
@@ -355,7 +367,14 @@ impl GroupTableBuilder {
             windows: Vec::new(),
             order: Vec::new(),
             columns: HashMap::new(),
+            gaps: Default::default(),
         }
+    }
+
+    /// The shortest and longest gap of the rows pushed so far, which the
+    /// segment's footer records (`crate::spacing::FOOTER_KEY`).
+    pub fn row_gaps(&self) -> Option<crate::spacing::SegmentSpacing> {
+        self.gaps.spacing()
     }
 
     /// Rows pushed so far — lets a caller that skipped some input rows (an
@@ -504,6 +523,7 @@ impl GroupTableBuilder {
     ) {
         let row = self.timestamps.len();
         self.timestamps.push(ts);
+        self.gaps.push(ts);
         self.wall_offsets.push(wall_offset_ns);
         self.windows.push(window);
 

@@ -142,7 +142,10 @@ fn materialize_sampler_wal_tail(
         builder.push_row(row.ts(), row.wall_offset(), &cells);
     }
     Ok(Some(MaterializedTail {
-        bytes: write_table_parquet_with(&builder.finish(), props)?,
+        bytes: {
+            let props = crate::spacing::with_footer(props, builder.row_gaps());
+            write_table_parquet_with(&builder.finish(), props)?
+        },
         rows: row_count,
         first_ts,
     }))
@@ -373,7 +376,10 @@ fn materialize_group_wal_tail(
         return Ok(None);
     }
     Ok(Some(MaterializedTail {
-        bytes: write_table_parquet_with(&builder.finish(), props)?,
+        bytes: {
+            let props = crate::spacing::with_footer(props, builder.row_gaps());
+            write_table_parquet_with(&builder.finish(), props)?
+        },
         rows: row_count,
         // `row_count > 0` implies the loop pushed at least one row, which is
         // exactly when `first_ts` gets set — never `None` here.
@@ -586,6 +592,142 @@ mod schema_rows_tests {
             .unwrap()
             .unwrap();
         assert_eq!((tail.rows, tail.first_ts), (4, 1));
+    }
+
+    /// A sealed segment's footer records the spacing of the rows it was
+    /// sealed from, wide and long; a table reader reads it from the footer,
+    /// measures a segment that records none, and keeps the key out of the
+    /// table's metadata.
+    #[test]
+    fn a_sealed_segment_records_its_spacing() {
+        use crate::segmented::{InMemorySegments, SegmentedSource};
+        use crate::spacing::{decode_spacing, segment_spacing, FOOTER_KEY};
+        use crate::DataSource;
+        let mut ts: Vec<u64> = (0..20).map(|i| i * 1000).collect();
+        ts.extend((1..=30).map(|i| 19_000 + i * 100));
+        let want = segment_spacing(&ts);
+        assert!(want.is_some());
+        // One schema, stated on the first row.
+        let group = |t: u64, s: Option<GroupSchema>, n: usize| {
+            let row = WalGroupRow {
+                schema_hash: (3, 3),
+                schema: s,
+                window: Some((t, t + 1)),
+                counters: vec![Some(t); n],
+                gauges: Vec::new(),
+                histograms: Vec::new(),
+            };
+            Row(t, encode_wal_group_row(&row).unwrap())
+        };
+        let wide: Vec<Row> = ts
+            .iter()
+            .enumerate()
+            .map(|(i, &t)| group(t, (i == 0).then(|| schema(&["a"])), 1))
+            .collect();
+        let long: Vec<Row> = ts
+            .iter()
+            .enumerate()
+            .map(|(i, &t)| {
+                let row = WalLongRow {
+                    schema_hash: (7, 300),
+                    schema: (i == 0).then(|| schema(&["a"])),
+                    window: None,
+                    occupants: vec![LongOccupant {
+                        occupant: 0,
+                        counters: vec![Some(t)],
+                        gauges: Vec::new(),
+                        histograms: Vec::new(),
+                    }],
+                };
+                Row(t, encode_wal_long_row(&row).unwrap())
+            })
+            .collect();
+        let pool = crate::BufferPool::new(1 << 20);
+        let footer = |bytes: &[u8]| {
+            let seg = crate::parquet::MultiParquetSource::open_bytes_with_pool(
+                bytes.to_vec(),
+                pool.clone(),
+            )
+            .unwrap();
+            seg.metadata_get(FOOTER_KEY)
+                .and_then(|v| decode_spacing(&v))
+        };
+        let sealed_wide = materialize_wal_tail("s/g", &wide).unwrap().unwrap().bytes;
+        let sealed_long = materialize_long_wal_tail("s/g", &long, false)
+            .unwrap()
+            .unwrap()
+            .bytes;
+        assert_eq!(footer(&sealed_wide), Some(want));
+        assert_eq!(footer(&sealed_long), Some(want));
+        let rows_of = |bytes: &[u8]| {
+            crate::parquet::MultiParquetSource::open_bytes_with_pool(bytes.to_vec(), pool.clone())
+                .unwrap()
+                .sample_timestamps()
+        };
+        assert_eq!(rows_of(&sealed_wide), ts);
+        // The long table's own keys are still there.
+        let seg = crate::parquet::MultiParquetSource::open_bytes_with_pool(
+            sealed_long.clone(),
+            pool.clone(),
+        )
+        .unwrap();
+        assert!(seg.metadata_get(crate::long::LAYOUT_KEY).is_some());
+
+        // A table of a recorded segment and an unrecorded one: the second is
+        // measured, and the two merge.
+        let later: Vec<u64> = (1..=10).map(|i| 30_000 + i * 5000).collect();
+        let unrecorded = {
+            let rows: Vec<Row> = later
+                .iter()
+                .enumerate()
+                .map(|(i, &t)| group(t, (i == 0).then(|| schema(&["a"])), 1))
+                .collect();
+            let bytes = materialize_wal_tail("s/g", &rows).unwrap().unwrap().bytes;
+            strip_key(&bytes, FOOTER_KEY)
+        };
+        assert_eq!(footer(&unrecorded), None);
+        let table = SegmentedSource::open_with_pool(
+            std::sync::Arc::new(InMemorySegments::new(vec![sealed_wide, unrecorded])),
+            pool.clone(),
+        )
+        .unwrap();
+        let later_spacing = segment_spacing(&later);
+        assert_eq!(
+            table.spacing_over(0, u64::MAX),
+            crate::spacing::merge_spacing(want, later_spacing)
+        );
+        assert_eq!(table.spacing_over(0, 25_000), want);
+        assert_eq!(table.spacing_over(40_000, u64::MAX), later_spacing);
+        assert!(table.metadata_get(FOOTER_KEY).is_none());
+    }
+
+    /// `bytes` rewritten without footer key `key`: a segment as a writer
+    /// that predates the key sealed it.
+    fn strip_key(bytes: &[u8], key: &str) -> Vec<u8> {
+        use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+        let b =
+            ParquetRecordBatchReaderBuilder::try_new(bytes::Bytes::copy_from_slice(bytes)).unwrap();
+        let kv: Vec<parquet::file::metadata::KeyValue> = b
+            .metadata()
+            .file_metadata()
+            .key_value_metadata()
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|e| e.key != key)
+            .collect();
+        let schema = b.schema().clone();
+        let batches: Vec<_> = b.build().unwrap().map(|r| r.unwrap()).collect();
+        let props = parquet::file::properties::WriterProperties::builder()
+            .set_key_value_metadata(Some(kv))
+            .build();
+        let mut out = Vec::new();
+        let mut w = parquet::arrow::ArrowWriter::try_new(&mut out, schema, Some(props)).unwrap();
+        for batch in &batches {
+            w.write(batch).unwrap();
+        }
+        w.close().unwrap();
+        out
     }
 
     /// A table of cells keeps each row whose names differ from the row

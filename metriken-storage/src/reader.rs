@@ -670,8 +670,6 @@ pub struct SamplerReader {
     /// WAL tail is materialized at open — so one read is enough, and the
     /// viewer holds its readers for the life of the process.
     row_timestamps: std::sync::OnceLock<Vec<u64>>,
-    /// [`Self::spacing_range`], worked out once from the row timestamps.
-    spacing_range: std::sync::OnceLock<Option<(f64, f64)>>,
 }
 
 impl SamplerReader {
@@ -930,18 +928,21 @@ impl SamplerReader {
         })
     }
 
-    /// The finest and the coarsest spacing of this table's rows outside
-    /// holes, in seconds ([`crate::spacing::spacing_range`]), or `None` with
-    /// fewer than two rows. Unlike [`interval`](Self::interval), measured
-    /// from every row, so a table whose spacing changes (100 ms rows, then
-    /// 1 s rows) answers (0.1, 1.0) where `interval` answers the median of
-    /// its first rows or its mean gap. Reads
-    /// [`row_timestamps`](Self::row_timestamps) on first use.
-    pub fn spacing_range(&self) -> Option<(f64, f64)> {
-        *self.spacing_range.get_or_init(|| {
-            crate::spacing::spacing_range(self.row_timestamps())
-                .map(|(lo, hi)| (lo as f64 / 1e9, hi as f64 / 1e9))
-        })
+    /// The row spacing of this table's segments that hold rows in
+    /// `[start_ns, end_ns]` ([`SegmentedSource::spacing_over`]): from the
+    /// spacing each segment's footer records, or for a segment sealed before
+    /// footers recorded it, measured from its rows once. Unlike
+    /// [`interval`](Self::interval), it covers every row in the range, so a
+    /// table whose spacing changes (100 ms rows, then 1 s rows) answers both
+    /// where `interval` answers the median of its first rows or its mean
+    /// gap. Opens the table's reader; `None` when it cannot be read or holds
+    /// no two rows apart there.
+    pub fn spacing_over(
+        &self,
+        start_ns: u64,
+        end_ns: u64,
+    ) -> Option<crate::spacing::SegmentSpacing> {
+        self.reader()?.segmented().spacing_over(start_ns, end_ns)
     }
 }
 
@@ -1472,7 +1473,6 @@ impl ArchiveReader {
                     occupant_segments: std::sync::Mutex::new(OccupantSegments::new()),
                     keep: std::sync::atomic::AtomicBool::new(false),
                     row_timestamps: std::sync::OnceLock::new(),
-                    spacing_range: std::sync::OnceLock::new(),
                 }));
             }
 
@@ -1617,7 +1617,6 @@ impl ArchiveReader {
                     occupant_segments: std::sync::Mutex::new(OccupantSegments::new()),
                     keep: std::sync::atomic::AtomicBool::new(false),
                     row_timestamps: std::sync::OnceLock::new(),
-                    spacing_range: std::sync::OnceLock::new(),
                 }));
             }
         }

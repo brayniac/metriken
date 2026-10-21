@@ -122,6 +122,9 @@ pub struct GaugeStepGrid {
     staleness_ns: u64,
     /// The spacing of the last pair asked, by the index of its later row.
     spacing: Option<(usize, Option<u64>)>,
+    /// The shortest nonzero gap between the samples, once asked: no pair's
+    /// spacing is shorter, so a hold that long needs no spacing.
+    floor: Option<u64>,
     place: Placement,
 }
 
@@ -143,6 +146,7 @@ impl GaugeStepGrid {
             end_ns,
             staleness_ns,
             spacing: None,
+            floor: None,
             place: Placement::new(raw, start_ns, step_ns),
         }
     }
@@ -153,6 +157,17 @@ impl GaugeStepGrid {
             return false;
         }
         if d <= self.place.step_ns {
+            return true;
+        }
+        let ts = &self.timestamps;
+        let floor = *self.floor.get_or_insert_with(|| {
+            ts.windows(2)
+                .map(|w| w[1].saturating_sub(w[0]))
+                .filter(|g| *g > 0)
+                .min()
+                .unwrap_or(u64::MAX)
+        });
+        if d <= floor {
             return true;
         }
         // Past the step, the pair's spacing decides; one pair is asked at

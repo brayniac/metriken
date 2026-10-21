@@ -71,6 +71,8 @@ pub struct CounterPairwiseRate<'a> {
     /// The longest gap a pair spans and gives a value: the read reaches
     /// that far back.
     max_gap_ns: u64,
+    /// The shortest nonzero gap of the pairs so far; see `spacing::is_hole`.
+    floor: u64,
 }
 
 impl<'a> CounterPairwiseRate<'a> {
@@ -87,6 +89,7 @@ impl<'a> CounterPairwiseRate<'a> {
             next: 0,
             end_ns,
             max_gap_ns: u64::MAX,
+            floor: u64::MAX,
         }
     }
 
@@ -136,7 +139,9 @@ impl<'a> Iterator for CounterPairwiseRate<'a> {
             if cur.0 == prev.0 {
                 continue;
             }
-            if !spacing::within(&self.held, i, cur.0 - prev.0, 4, self.max_gap_ns) {
+            let gap = cur.0 - prev.0;
+            self.floor = self.floor.min(gap);
+            if !spacing::within(&self.held, i, gap, 4, self.max_gap_ns, self.floor) {
                 return Some(Point::timing_at(cur.0));
             }
             if let Some(point) = pair_rate((prev, cur)) {
@@ -195,9 +200,12 @@ pub(crate) fn range_start<K: Stamped>(
     from: u64,
     at: u64,
     reach_ns: u64,
+    floor: u64,
 ) -> Option<u64> {
     let i = kept.partition_point(|k| k.ts() <= from);
-    if i > 0 && spacing::within(kept, i, from - kept[i - 1].ts(), 2, reach_ns) {
+    // A sample at or after `at`, which is later than `from`, is kept, so
+    // `i` names a pair.
+    if i > 0 && spacing::within(kept, i, from - kept[i - 1].ts(), 2, reach_ns, floor) {
         return Some(from);
     }
     kept.get(i).map(Stamped::ts).filter(|s| *s < at)
@@ -256,6 +264,8 @@ pub struct CounterGridRate<'a> {
     last_ts: Option<u64>,
     /// Samples pulled so far.
     pulled: usize,
+    /// The shortest nonzero gap pulled; see `spacing::is_hole`.
+    floor: u64,
     /// The previous raw value and the running reset-adjusted cumulative.
     prev_value: Option<u64>,
     acc: f64,
@@ -331,6 +341,7 @@ impl<'a> CounterGridRate<'a> {
             first_ts: None,
             last_ts: None,
             pulled: 0,
+            floor: u64::MAX,
             prev_value: None,
             acc: 0.0,
             windowed,
@@ -373,6 +384,13 @@ impl<'a> CounterGridRate<'a> {
             };
         }
         self.prev_value = Some(sample.value);
+        if let Some(gap) = self
+            .last_ts
+            .map(|l| sample.ts.saturating_sub(l))
+            .filter(|g| *g > 0)
+        {
+            self.floor = self.floor.min(gap);
+        }
         self.first_ts.get_or_insert(sample.ts);
         self.last_ts = Some(sample.ts);
         self.pulled += 1;
@@ -463,7 +481,7 @@ impl<'a> CounterGridRate<'a> {
         if hi == 0 || hi >= self.kept.len() {
             return None;
         }
-        if spacing::is_hole(&self.kept, hi) {
+        if spacing::is_hole(&self.kept, hi, self.floor) {
             return None;
         }
         self.interp_window(edge, hi)
@@ -643,7 +661,7 @@ impl<'a> Iterator for CounterGridRate<'a> {
             // holds the next point for the gap from it (`super::Held`).
             let none = |samples: bool| samples.then(|| Point::timing_at(t));
             let from = if self.range {
-                match range_start(&self.kept, from, at, self.reach_ns) {
+                match range_start(&self.kept, from, at, self.reach_ns, self.floor) {
                     Some(from) => from,
                     None => match none(self.samples.is_some()) {
                         Some(p) => return Some(p),

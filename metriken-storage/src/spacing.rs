@@ -1,5 +1,5 @@
-//! The spacing of a series' rows near a pair of them, and the finest and
-//! coarsest spacing of a table.
+//! The spacing of a series' rows near a pair of them, and the shortest and
+//! longest gap of a segment's rows.
 //!
 //! The spacing of a pair of consecutive rows is the larger of the median of
 //! up to [`SIDE_GAPS`] gaps before the pair and the median of up to
@@ -13,9 +13,11 @@
 //! count is the upper of the two middle gaps.
 //!
 //! metriken-query takes its per-point bounds from this
-//! ([`spacing_at_least`]), and a table's cadence, for evaluating a query
-//! across tables of different cadence, from [`spacing_range`] and
-//! [`pair_spacings`] (`SamplerReader::spacing_range`).
+//! ([`spacing_at_least`]), a table's cadence for evaluating a query across
+//! tables of different cadence from [`pair_spacings`], and an archive
+//! table's interval hint from the [`SegmentSpacing`] each segment records
+//! (`SamplerReader::spacing_over`): the shortest and longest gap of its
+//! rows, kept by [`RowGaps`] as the rows are appended.
 
 /// How many gaps on each side of a pair its spacing is the median of.
 pub const SIDE_GAPS: usize = 8;
@@ -151,17 +153,141 @@ pub fn pair_spacings(ts: &[u64]) -> Vec<(usize, Option<u64>)> {
         .collect()
 }
 
-/// The finest and coarsest spacing of `ts`'s rows outside holes, or `None`
-/// with fewer than two rows (or only holes): the intervals a table whose
-/// spacing changes is read at, at its fastest and slowest.
-pub fn spacing_range(ts: &[u64]) -> Option<(u64, u64)> {
-    pair_spacings(ts)
-        .into_iter()
-        .filter_map(|(_, s)| s)
-        .fold(None, |acc, s| match acc {
-            None => Some((s, s)),
-            Some((lo, hi)) => Some((lo.min(s), hi.max(s))),
-        })
+/// A segment's row spacing, recorded in its footer under [`FOOTER_KEY`]
+/// when the segment is written, so a reader knows how far apart a table's
+/// rows are over a range from the footers it already reads at open, without
+/// decoding a column: the shortest and the longest gap between two
+/// consecutive rows, in nanoseconds, two rows at one time excepted. A gap
+/// that is a hole counts, so `max_gap` bounds every spacing in the segment
+/// from above, and `min_gap` from below.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct SegmentSpacing {
+    pub min_gap: u64,
+    pub max_gap: u64,
+}
+
+/// The gaps of rows as they are appended to a segment, kept as they arrive:
+/// one subtraction and two comparisons per row, nothing held but the last
+/// stamp. Every segment builder keeps one.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct RowGaps {
+    prev: Option<u64>,
+    gaps: Option<(u64, u64)>,
+}
+
+impl RowGaps {
+    /// A row stamped `ts`, after the rows already pushed. A row at the stamp
+    /// of the one before (a long segment's next occupant) adds no gap.
+    #[inline]
+    pub fn push(&mut self, ts: u64) {
+        if let Some(prev) = self.prev.replace(ts) {
+            let gap = ts.abs_diff(prev);
+            if gap > 0 {
+                self.gaps = Some(match self.gaps {
+                    Some((lo, hi)) => (lo.min(gap), hi.max(gap)),
+                    None => (gap, gap),
+                });
+            }
+        }
+    }
+
+    /// The spacing of the rows pushed, or `None` without a nonzero gap.
+    pub fn spacing(&self) -> Option<SegmentSpacing> {
+        self.gaps
+            .map(|(min_gap, max_gap)| SegmentSpacing { min_gap, max_gap })
+    }
+}
+
+/// The footer key a segment's [`SegmentSpacing`] is recorded under.
+///
+/// The value is `1:<min_gap>,<max_gap>`, or `1:-` for a segment with no gap.
+/// The leading number is the encoding's version: a reader takes the first
+/// two fields of version 1 and ignores any after them, and treats another
+/// version as absent, as it treats a segment written before the key existed:
+/// it measures the segment's rows itself. A reader that predates the key
+/// ignores it, as it does any footer key it does not know.
+pub const FOOTER_KEY: &str = "metriken.spacing";
+
+/// The spacing of rows stamped `ts`, in any order and with repeats (a long
+/// segment has a row per occupant per tick): of the distinct stamps, in
+/// order. `None` with no nonzero gap. What a reader measures for a segment
+/// that records none.
+pub fn segment_spacing(ts: &[u64]) -> Option<SegmentSpacing> {
+    let mut gaps = RowGaps::default();
+    if ts.windows(2).all(|w| w[0] <= w[1]) {
+        ts.iter().for_each(|&t| gaps.push(t));
+    } else {
+        let mut sorted = ts.to_vec();
+        sorted.sort_unstable();
+        sorted.iter().for_each(|&t| gaps.push(t));
+    }
+    gaps.spacing()
+}
+
+/// `props` with `spacing` in the footer it writes, under [`FOOTER_KEY`],
+/// replacing one it carries.
+pub(crate) fn with_footer(
+    props: parquet::file::properties::WriterProperties,
+    spacing: Option<SegmentSpacing>,
+) -> parquet::file::properties::WriterProperties {
+    let mut kv = props.key_value_metadata().cloned().unwrap_or_default();
+    kv.retain(|e| e.key != FOOTER_KEY);
+    kv.push(parquet::file::metadata::KeyValue::new(
+        FOOTER_KEY.to_string(),
+        encode_spacing(spacing),
+    ));
+    props
+        .into_builder()
+        .set_key_value_metadata(Some(kv))
+        .build()
+}
+
+/// Whether `props` carries a footer spacing already.
+pub(crate) fn has_footer(props: &parquet::file::properties::WriterProperties) -> bool {
+    props
+        .key_value_metadata()
+        .is_some_and(|kv| kv.iter().any(|e| e.key == FOOTER_KEY))
+}
+
+/// The footer value recording `spacing` (see [`FOOTER_KEY`]).
+pub fn encode_spacing(spacing: Option<SegmentSpacing>) -> String {
+    match spacing {
+        Some(s) => format!("1:{},{}", s.min_gap, s.max_gap),
+        None => "1:-".to_string(),
+    }
+}
+
+/// The spacing a footer value records: `Some(None)` for a segment with no
+/// gap, `None` for a value this reader does not read (another version, or
+/// malformed), which a reader treats as a segment that recorded none.
+pub fn decode_spacing(value: &str) -> Option<Option<SegmentSpacing>> {
+    let rest = value.strip_prefix("1:")?;
+    if rest == "-" {
+        return Some(None);
+    }
+    let mut fields = rest.split(',').map(|f| f.parse::<u64>());
+    let mut next = || fields.next()?.ok();
+    let s = SegmentSpacing {
+        min_gap: next()?,
+        max_gap: next()?,
+    };
+    (s.min_gap > 0 && s.min_gap <= s.max_gap).then_some(Some(s))
+}
+
+/// The spacing over several segments: the shortest gap of any, the longest
+/// of any.
+pub fn merge_spacing(
+    a: Option<SegmentSpacing>,
+    b: Option<SegmentSpacing>,
+) -> Option<SegmentSpacing> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some(SegmentSpacing {
+            min_gap: a.min_gap.min(b.min_gap),
+            max_gap: a.max_gap.max(b.max_gap),
+        }),
+        (a, b) => a.or(b),
+    }
 }
 
 #[cfg(test)]
@@ -188,20 +314,26 @@ mod tests {
         assert_eq!(at(&ts, ts.len()), Some(1000));
         // A pair alone has no spacing.
         assert_eq!(at(&[5, 9], 1), None);
-        assert_eq!(spacing_range(&ts), Some((100, 1000)));
+        assert_eq!(
+            segment_spacing(&ts).map(|s| (s.min_gap, s.max_gap)),
+            Some((100, 1000))
+        );
     }
 
     /// A long gap is measured against the spacing around it, not itself, so
-    /// it is a hole and not the coarsest spacing.
+    /// it is a hole; it is the segment's longest gap.
     #[test]
     fn a_gap_is_not_its_own_spacing() {
         let mut ts: Vec<u64> = (0..10).map(|i| i * 100).collect();
         ts.extend((0..10).map(|i| 5000 + i * 100));
         let hi = ts.iter().position(|&t| t == 5000).unwrap();
         assert_eq!(at(&ts, hi), Some(100));
-        assert_eq!(spacing_range(&ts), Some((100, 100)));
-        assert_eq!(spacing_range(&[5, 9]), Some((4, 4)));
-        assert_eq!(spacing_range(&[5]), None);
+        assert_eq!(
+            segment_spacing(&ts).map(|s| (s.min_gap, s.max_gap)),
+            Some((100, 4100))
+        );
+        assert_eq!(segment_spacing(&[5, 9]).map(|s| s.max_gap), Some(4));
+        assert_eq!(segment_spacing(&[5]), None);
     }
 
     /// `spacing_at_least` and `pair_spacings` answer as `local_spacing`
@@ -253,5 +385,35 @@ mod tests {
     fn zero_gaps_are_skipped_and_an_even_count_takes_the_upper_middle() {
         assert_eq!(at(&[0, 0, 0, 10, 10, 30], 6), Some(20));
         assert_eq!(at(&[0, 10, 30, 60, 100], 5), Some(30));
+    }
+
+    /// A segment's spacing round-trips through its footer value; a value of
+    /// another version or a malformed one reads as absent; fields after the
+    /// second are ignored. Rows pushed one at a time give what the stamps
+    /// measure.
+    #[test]
+    fn segment_spacing_round_trips_and_tolerates_other_versions() {
+        let mut ts: Vec<u64> = (0..20).map(|i| i * 1000).collect();
+        ts.extend((1..=50).map(|i| 19_000 + i * 100));
+        let s = segment_spacing(&ts).unwrap();
+        assert_eq!((s.min_gap, s.max_gap), (100, 1000));
+        let mut gaps = RowGaps::default();
+        for &t in &ts {
+            gaps.push(t);
+            gaps.push(t);
+        }
+        assert_eq!(gaps.spacing(), Some(s));
+        assert_eq!(decode_spacing(&encode_spacing(Some(s))), Some(Some(s)));
+        assert_eq!(decode_spacing(&encode_spacing(None)), Some(None));
+        assert_eq!(segment_spacing(&[7]), None);
+        assert_eq!(segment_spacing(&[7, 7]), None);
+        // Unsorted rows read as sorted.
+        let mut shuffled = ts.clone();
+        shuffled.reverse();
+        assert_eq!(segment_spacing(&shuffled), Some(s));
+        assert_eq!(decode_spacing("1:100,1000,42,extra"), Some(Some(s)));
+        for bad in ["2:100,1000", "1:100", "1:x,1", "1:0,1", "1:5,4", "", "MNS1"] {
+            assert_eq!(decode_spacing(bad), None, "{bad}");
+        }
     }
 }

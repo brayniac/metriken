@@ -260,24 +260,28 @@ fn cross_cadence(
     // So a sampler's cadence at a time is the spacing of its DENSEST
     // participating table there — the one that shows the underlying read
     // schedule.
-    // First from each table's finest and coarsest spacing, worked out once
-    // per table: no span can differ in cadence unless some sampler's coarsest
-    // is at least twice another's finest, and coarser than the step. Most
-    // queries stop here without walking any rows.
-    let mut extent: BTreeMap<&str, (f64, f64)> = BTreeMap::new();
+    // First from each table's shortest and longest row gap over the range,
+    // which its segments record: no span can differ in cadence unless some
+    // sampler's longest gap is at least twice another's shortest, and longer
+    // than the step. (A hole lengthens the longest gap, which only sends a
+    // query on to the walk below.) Most queries stop here without reading
+    // any rows.
+    let (from, to) = range.unwrap_or((0, u64::MAX));
+    let mut extent: BTreeMap<&str, (u64, u64)> = BTreeMap::new();
     for t in owners {
-        if let Some((lo, hi)) = t.spacing_range() {
+        if let Some(s) = t.spacing_over(from, to) {
             extent
                 .entry(table_sampler(t.sampler()))
-                .and_modify(|e| *e = (e.0.min(lo), e.1.max(hi)))
-                .or_insert((lo, hi));
+                .and_modify(|e| *e = (e.0.min(s.min_gap), e.1.max(s.max_gap)))
+                .or_insert((s.min_gap, s.max_gap));
         }
     }
+    let step_ns = (step_s * 1e9) as u64;
     let differ = extent.iter().any(|(a, (_, slow))| {
-        *slow > step_s
+        *slow > step_ns
             && extent
                 .iter()
-                .any(|(b, (fast, _))| a != b && *slow >= 2.0 * fast)
+                .any(|(b, (fast, _))| a != b && *slow >= fast.saturating_mul(2))
     });
     if !differ {
         return None;
@@ -300,7 +304,6 @@ fn cross_cadence(
     if samplers.len() < 2 {
         return None;
     }
-    let step_ns = (step_s * 1e9) as u64;
 
     // Every time a table's cadence can change, and between each two, which
     // table's rows the points are (`Some`) or the grid (`None`).
@@ -448,7 +451,14 @@ fn cadence_runs(ts: &[u64]) -> Vec<Run> {
 /// (`gpu_nvidia` and `gpu_amd_smi` both publish `gpu_utilization`), and a
 /// name that is a different kind in two recordings the query reaches.
 /// Errors too when the query references no known metric.
-fn engine(plan: &Plan<'_>, query: &str) -> Result<Option<QueryEngine>, QueryError> {
+///
+/// `window` is the time the query evaluates over, `[start, end]` in
+/// nanoseconds, which sets the interval each table reports ([`timed`]).
+fn engine(
+    plan: &Plan<'_>,
+    query: &str,
+    window: Option<(u64, u64)>,
+) -> Result<Option<QueryEngine>, QueryError> {
     if plan.owners.is_empty() {
         return Err(QueryError::ParseError(format!(
             "query references no metric present in this .rez: {query}"
@@ -467,7 +477,7 @@ fn engine(plan: &Plan<'_>, query: &str) -> Result<Option<QueryEngine>, QueryErro
     }
     let mut sources: Vec<Arc<dyn DataSource>> = Vec::new();
     for tables in &recordings {
-        if let Some(source) = recording_source(tables, query)? {
+        if let Some(source) = recording_source(tables, query, window)? {
             let labels = plan.labels.of(tables[0]).clone();
             sources.push(Arc::new(LabeledSource::new(source, labels)));
         }
@@ -611,16 +621,68 @@ fn refuse_kinds_across_recordings(
 /// and holding its gauges for it, or `fallback` for a table whose spacing
 /// was not measured (one row). A segment that declares no interval reports
 /// 1 s, which would hold a 10 s table's gauge 1 s past each row.
+///
+/// Over a query `window`, the interval is the larger of the probed one and
+/// the longest gap between the table's rows there, which its segments record
+/// (`SamplerReader::spacing_over`). A rate's reach, a gauge's hold and a raw
+/// pair's gap are each the spacing of the rows near a point, capped at what
+/// the interval gives, because a read starts that far before a range
+/// (`promql::streaming::spacing`); no spacing exceeds the longest gap, so
+/// the cap does not bind. The probed interval of a table whose spacing
+/// changes is the median of its first rows or its mean gap, and the cap at it
+/// read a 1 s span of a table probed at 100 ms as holes. A hole in the window
+/// lengthens the read-back by four of its length, not the answer. The window
+/// is widened by four of the interval (a rate's read-back) and measured again
+/// once if that finds a longer gap.
 fn timed(
     table: &SamplerReader,
     reader: &TableReader,
     fallback: Option<f64>,
+    window: Option<(u64, u64)>,
 ) -> Arc<dyn DataSource> {
     let source = LabeledSource::new(reader.source(), Default::default());
-    match Some(table.interval()).filter(|i| *i > 0.0).or(fallback) {
+    let probed = Some(table.interval()).filter(|i| *i > 0.0).or(fallback);
+    let longest = |hint: f64| {
+        let (start, end) = window?;
+        let reach = (hint * 4e9) as u64;
+        table
+            .spacing_over(start.saturating_sub(reach), end.saturating_add(reach))
+            .map(|s| s.max_gap as f64 / 1e9)
+    };
+    let measured = longest(probed.unwrap_or(0.0)).map(|first| {
+        if first > probed.unwrap_or(0.0) {
+            longest(first).map_or(first, |again| again.max(first))
+        } else {
+            first
+        }
+    });
+    let interval = match (probed, measured) {
+        (Some(p), Some(m)) => Some(p.max(m)),
+        (p, m) => p.or(m),
+    };
+    match interval {
         Some(i) => Arc::new(source.with_interval(i)),
         None => Arc::new(source),
     }
+}
+
+/// The longest range a matrix selector or subquery of `query` reads back,
+/// in nanoseconds; zero when it has none or does not parse.
+fn longest_range(query: &str) -> u64 {
+    use promql_parser::parser::Expr;
+    fn walk(e: &Expr) -> u64 {
+        match e {
+            Expr::Aggregate(a) => walk(&a.expr),
+            Expr::Unary(u) => walk(&u.expr),
+            Expr::Binary(b) => walk(&b.lhs).max(walk(&b.rhs)),
+            Expr::Paren(p) => walk(&p.expr),
+            Expr::Call(c) => c.args.args.iter().map(|a| walk(a)).max().unwrap_or(0),
+            Expr::MatrixSelector(m) => m.range.as_nanos() as u64,
+            Expr::Subquery(s) => (s.range.as_nanos() as u64).saturating_add(walk(&s.expr)),
+            _ => 0,
+        }
+    }
+    promql_parser::parser::parse(query).map_or(0, |e| walk(&e))
 }
 
 /// One recording's tables that hold a metric of `query`, as one source: the
@@ -629,7 +691,9 @@ fn timed(
 fn recording_source(
     tables: &[&SamplerReader],
     query: &str,
+    window: Option<(u64, u64)>,
 ) -> Result<Option<Arc<dyn DataSource>>, QueryError> {
+    let window = window.map(|(start, end)| (start.saturating_sub(longest_range(query)), end));
     // The finest measured interval among the recording's tables.
     let fallback = tables
         .iter()
@@ -637,7 +701,7 @@ fn recording_source(
         .filter(|i| *i > 0.0)
         .min_by(f64::total_cmp);
     if let [one] = tables {
-        return Ok(one.reader().map(|r| timed(one, r, fallback)));
+        return Ok(one.reader().map(|r| timed(one, r, fallback, window)));
     }
     // Building the union only touches each table's already-open,
     // footer-level name catalog (no row-group decode), so a fresh one per
@@ -654,7 +718,7 @@ fn recording_source(
         .iter()
         .filter_map(|t| {
             t.reader()
-                .map(|r| UnionChild::from_source(timed(t, r, fallback)))
+                .map(|r| UnionChild::from_source(timed(t, r, fallback, window)))
         })
         .collect();
     if children.is_empty() {
@@ -709,7 +773,15 @@ impl MetricsSource for ArchiveReader {
         opts: &QueryOptions,
     ) -> Result<QueryResult, QueryError> {
         let plan = Plan::new(self, expr)?;
-        let Some(engine) = engine(&plan, expr)? else {
+        let Some(engine) = engine(
+            &plan,
+            expr,
+            Some((
+                crate::promql::range_start_ns(start_s),
+                crate::promql::range_end_ns(end_s),
+            )),
+        )?
+        else {
             return Ok(QueryResult::Matrix { result: Vec::new() });
         };
         checked(engine.query_range_opts(
@@ -732,7 +804,15 @@ impl MetricsSource for ArchiveReader {
         qopts: &QueryOptions,
     ) -> Result<crate::DisplayResult, QueryError> {
         let plan = Plan::new(self, expr)?;
-        let Some(engine) = engine(&plan, expr)? else {
+        let Some(engine) = engine(
+            &plan,
+            expr,
+            Some((
+                crate::promql::range_start_ns(start_s),
+                crate::promql::range_end_ns(end_s),
+            )),
+        )?
+        else {
             return Ok(crate::DisplayResult::Series {
                 result: Vec::new(),
                 budget: opts.budget as u32,
@@ -757,7 +837,17 @@ impl MetricsSource for ArchiveReader {
                 .then(|| ArchiveReader::time_range_ns(self).map(|(_, end)| end as f64 / 1e9))
                 .flatten()
         });
-        let Some(engine) = engine(&plan, expr)? else {
+        let Some(engine) = engine(
+            &plan,
+            expr,
+            time.map(|t| {
+                (
+                    crate::promql::range_start_ns(t),
+                    crate::promql::range_end_ns(t),
+                )
+            }),
+        )?
+        else {
             return Ok(QueryResult::Vector { result: Vec::new() });
         };
         checked(engine.query(expr, time)?)

@@ -102,6 +102,8 @@ pub(crate) struct SeriesRate {
     /// no spacing; see `range_start`.
     reach_ns: u64,
     pulled: usize,
+    /// The shortest nonzero gap pushed; see `spacing::is_hole`.
+    floor: u64,
     prev_value: Option<u64>,
     acc: f64,
     first_ts: Option<u64>,
@@ -131,6 +133,7 @@ impl SeriesRate {
             windowed,
             reach_ns,
             pulled: 0,
+            floor: u64::MAX,
             prev_value: None,
             acc: 0.0,
             first_ts: None,
@@ -206,6 +209,13 @@ impl SeriesRate {
         if self.last_edge.is_some_and(|(at, _)| at == s.ts) {
             self.last_edge = None;
         }
+        if let Some(gap) = self
+            .last_ts
+            .map(|l| s.ts.saturating_sub(l))
+            .filter(|g| *g > 0)
+        {
+            self.floor = self.floor.min(gap);
+        }
         self.first_ts.get_or_insert(s.ts);
         self.last_ts = Some(s.ts);
         self.pulled += 1;
@@ -262,7 +272,13 @@ impl SeriesRate {
                 }
             };
             let from = if grid.range {
-                match crate::promql::streaming::range_start(&self.kept, from, at, self.reach_ns) {
+                match crate::promql::streaming::range_start(
+                    &self.kept,
+                    from,
+                    at,
+                    self.reach_ns,
+                    self.floor,
+                ) {
                     Some(from) => from,
                     None => continue,
                 }
@@ -319,8 +335,9 @@ impl SeriesRate {
         let cum = Some(k_lo.cum + frac * (k_hi.cum - k_lo.cum));
         // A hole: the reads either side are further apart than twice their
         // spacing, and no read describes the edge.
-        let hole = spacing::is_hole(&self.kept, hi);
-        let window = if !self.windowed || hole {
+        let window = if !self.windowed
+            || spacing::is_hole_gap(&self.kept, hi, k_hi.ts - k_lo.ts, self.floor)
+        {
             None
         } else {
             k_lo.window

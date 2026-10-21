@@ -190,9 +190,11 @@ pub trait DataSource: Send + Sync {
     }
     /// Gauge `name`'s series for a grid from `start_ns` to `end_ns` at
     /// `step_ns`, as parts whose series share one sampling interval, each
-    /// returned with that interval in seconds. A gauge is held a step, or its
-    /// interval when that is longer, past each sample, so each part is read
-    /// from that far before `start_ns`. A source joining recordings of different intervals gives
+    /// returned with that interval in seconds. The query engine holds a gauge
+    /// past each sample for the step, or the spacing of the samples around
+    /// the point when that is longer, and at most for the interval when that
+    /// is longer than the step, so each part is read from that far before
+    /// `start_ns`. A source joining recordings of different intervals gives
     /// each recording's series its own. The default is one part at
     /// [`interval`](Self::interval).
     fn gauge_parts(

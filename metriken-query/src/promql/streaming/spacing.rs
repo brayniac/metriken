@@ -17,10 +17,12 @@
 //! The reach, the gauge's hold and the raw pair's gap are no longer than
 //! the hint gives, because a read starts that far before the range: a bound
 //! past it would reach samples a later start does not read, and a result
-//! would depend on where its range starts. So where a series' rows are
-//! further apart than its hint (a table whose first rows are 100 ms apart
-//! and later ones 1 s), those three are still the hint's. The hole test has
-//! no cap: it only decides whether a point has a band.
+//! would depend on where its range starts. An archive table's hint is at
+//! least the longest gap between rows its segments record over the query's
+//! window (`archive::timed`), so there the cap does not bind; a source whose
+//! hint is finer than its rows (a `MemoryStore` declaring 100 ms over 1 s
+//! rows) is still held to it. The hole test has no cap: it only decides
+//! whether a point has a band.
 
 use std::cell::Cell;
 use std::collections::VecDeque;
@@ -61,13 +63,27 @@ pub(crate) fn at_least<K: Stamped>(kept: &VecDeque<K>, hi: usize, x: u64) -> Opt
 
 /// Whether the gap between `kept[hi - 1]` and `kept[hi]` is a hole: longer
 /// than twice the pair's spacing. A pair with no spacing is not a hole.
-pub(crate) fn is_hole<K: Stamped>(kept: &VecDeque<K>, hi: usize) -> bool {
+///
+/// `floor` is the shortest nonzero gap the producer has read, or `u64::MAX`
+/// before it has read one. The pair's spacing is a median of gaps the
+/// producer has read (it holds [`SIDE_GAPS`] samples past a pair before it
+/// asks), so it is at least `floor`, and a gap no longer than twice `floor`
+/// is no hole: one comparison, which answers for a regular series.
+pub(crate) fn is_hole<K: Stamped>(kept: &VecDeque<K>, hi: usize, floor: u64) -> bool {
+    is_hole_gap(kept, hi, kept[hi].ts() - kept[hi - 1].ts(), floor)
+}
+
+/// [`is_hole`] for a caller that has the pair's `gap` in hand: the common
+/// answer is then one comparison, with no lookup.
+pub(crate) fn is_hole_gap<K: Stamped>(kept: &VecDeque<K>, hi: usize, gap: u64, floor: u64) -> bool {
+    if gap <= floor.saturating_mul(2) {
+        return false;
+    }
     let memo = &kept[hi].hole().0;
     match memo.get() {
         HoleMemo::HOLE => true,
         HoleMemo::NOT => false,
         _ => {
-            let gap = kept[hi].ts() - kept[hi - 1].ts();
             let hole = at_least(kept, hi, gap.div_ceil(2)) == Some(false);
             memo.set(if hole { HoleMemo::HOLE } else { HoleMemo::NOT });
             hole
@@ -80,16 +96,23 @@ pub(crate) fn is_hole<K: Stamped>(kept: &VecDeque<K>, hi: usize) -> bool {
 /// within `cap`: `d <= min(times * spacing, cap)`, or `d <= cap` for a pair
 /// with no spacing. What a rate's reach (two spacings) and a raw pair's gap
 /// (four) are. A pair that is not a hole is at most two spacings apart, so
-/// only a hole needs the spacing itself.
+/// only a hole needs the spacing itself. `floor` is as [`is_hole`] takes it.
 pub(crate) fn within<K: Stamped>(
     kept: &VecDeque<K>,
     hi: usize,
     d: u64,
     times: u64,
     cap: u64,
+    floor: u64,
 ) -> bool {
-    d <= cap && (!is_hole(kept, hi) || at_least(kept, hi, d.div_ceil(times)) != Some(false))
+    // `d` is no longer than the pair's gap, and the pair's spacing is at
+    // least `floor`: within twice it, the answer needs no lookup.
+    d <= cap
+        && (d <= floor.saturating_mul(2)
+            || !is_hole(kept, hi, floor)
+            || at_least(kept, hi, d.div_ceil(times)) != Some(false))
 }
+
 /// Whether `kept`, in time order, holds [`SIDE_GAPS`] samples after the
 /// first at or after `t`: what a point at `t` needs to know the spacing of
 /// the pairs it reads.

@@ -9,13 +9,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- Added `spacing`: the spacing of a series' rows near a pair of them (the
-  larger of the median of up to eight gaps before the pair and the median of
-  up to eight after it), `spacing_at_least`, which compares it with a value
-  without sorting, `pair_spacings`, the spacing of every pair of a table's
-  rows with holes marked, and `spacing_range`, the finest and coarsest of
-  those. `SamplerReader::spacing_range` answers the last for a table, from
-  its row timestamps, once.
+- Every segment records the shortest and longest gap between its rows in
+  its footer under `metriken.spacing` (`spacing::FOOTER_KEY`), as
+  `1:<min>,<max>`. The builders (`TableBuilder`, `GroupTableBuilder`,
+  `LongTableBuilder`) keep them as rows are appended (`spacing::RowGaps`: one
+  subtraction and two comparisons per row, measured at 1 ns a row against
+  5 to 112 µs a row to materialize the segment), so a seal, a WAL tail a
+  reader materializes and a `.rez` segment all carry them;
+  `write_table_parquet_with` folds them over the stamps of a table it is
+  given without them. A reader that predates the key ignores it, as it does
+  any footer key it does not know. It adds 38 bytes to a footer. The record
+  is not in the segment index: a reader up to this one takes a segment whose
+  index is not the 12-byte names fingerprint to hold the first segment's
+  names, so a longer record would hide metric names that first appear in a
+  later segment.
+- Added `SegmentedSource::spacing_over` and `SamplerReader::spacing_over`:
+  the row spacing of a table's segments over a range, from their footers. A
+  segment sealed before the key is measured from its timestamps the first
+  time a range reaches it, and the measurement kept for the reader's life;
+  that decodes its `timestamp` column once (a long segment's holds a row per
+  occupant).
+- Added the `spacing` module: the spacing of a pair of rows (the larger of
+  the median of up to eight gaps before the pair and the median of up to
+  eight after it), `spacing_at_least`, which compares it with a value
+  without sorting, `pair_spacings`, and the per-segment `SegmentSpacing`,
+  `RowGaps` and the footer encoding. `TableBuilder::row_gaps` and
+  `GroupTableBuilder::row_gaps` report what a builder has kept.
+- A table's merged file metadata leaves the spacing key out: it describes
+  one segment.
+- `DataSource::gauge_parts`'s documentation says how long the engine holds a
+  gauge (the step, or the spacing around the point when longer, at most the
+  interval).
 
 ## [0.4.0] - 2026-10-19
 

@@ -401,11 +401,20 @@ impl OpenState {
                 }
             }
         }
-        // Last segment wins on collision.
-        self.file_metadata.extend(seg.file_metadata());
+        // Last segment wins on collision. A segment's own spacing is not the
+        // table's metadata.
+        let spacing = seg
+            .metadata_get(crate::spacing::FOOTER_KEY)
+            .and_then(|v| crate::spacing::decode_spacing(&v));
+        self.file_metadata.extend(
+            seg.file_metadata()
+                .into_iter()
+                .filter(|(k, _)| k != crate::spacing::FOOTER_KEY),
+        );
         self.catalog.push(SegmentCatalog {
             span: seg.time_range(),
             interval: seg.interval(),
+            spacing,
             present: true,
         });
         self.opened += 1;
@@ -424,6 +433,11 @@ struct SegmentCatalog {
     span: Option<(u64, u64)>,
     /// Declared sampling interval, seconds.
     interval: f64,
+    /// The row spacing the footer records ([`crate::spacing::FOOTER_KEY`]):
+    /// `Some(None)` for a segment with no gap, `None` for one that records
+    /// none (sealed before the key, or by another writer), which
+    /// [`SegmentedSource::spacing_over`] measures from its rows when asked.
+    spacing: Option<Option<crate::spacing::SegmentSpacing>>,
     /// False for a segment the store no longer had at open. Never fetched.
     present: bool,
 }
@@ -432,6 +446,7 @@ impl SegmentCatalog {
     const GONE: Self = Self {
         span: None,
         interval: f64::MAX,
+        spacing: Some(None),
         present: false,
     };
 
@@ -727,6 +742,9 @@ pub struct SegmentedSource {
     /// What open built from the leading keyed segments, for a reader
     /// reopened over the same table.
     sealed: Option<Sealed>,
+    /// The spacing of segments whose footers record none, measured from
+    /// their rows the first time [`Self::spacing_over`] reaches them.
+    measured: Mutex<HashMap<usize, Option<crate::spacing::SegmentSpacing>>>,
 }
 
 /// The open state after a table's leading keyed segments.
@@ -941,6 +959,7 @@ impl SegmentedSource {
                 relabeled,
                 state,
             }),
+            measured: Mutex::new(HashMap::new()),
         });
         Ok(source)
     }
@@ -967,6 +986,63 @@ impl SegmentedSource {
     /// order; `None` for a segment that is gone or has no timestamps.
     pub fn segment_spans(&self) -> Vec<Option<(u64, u64)>> {
         self.state.catalog.iter().map(|c| c.span).collect()
+    }
+
+    /// The row spacing of the segments that hold rows in `[start_ns,
+    /// end_ns]`, merged ([`crate::spacing::merge_spacing`]): from each
+    /// segment's footer, or, for a segment whose footer records none (one
+    /// sealed before the key), measured from its timestamps the first time
+    /// it is asked and kept. Measuring decodes the segment's `timestamp`
+    /// column, and a long segment's holds a row per occupant. `None` when
+    /// no segment there has two rows apart.
+    pub fn spacing_over(
+        &self,
+        start_ns: u64,
+        end_ns: u64,
+    ) -> Option<crate::spacing::SegmentSpacing> {
+        let mut out = None;
+        for (idx, c) in self.state.catalog.iter().enumerate() {
+            if !c.touches(start_ns, end_ns) {
+                continue;
+            }
+            let spacing = match c.spacing {
+                Some(s) => s,
+                None => self.measure(idx),
+            };
+            out = crate::spacing::merge_spacing(out, spacing);
+        }
+        out
+    }
+
+    /// The spacing of segment `idx` measured from its rows, kept. A segment
+    /// that cannot be read has none.
+    fn measure(&self, idx: usize) -> Option<crate::spacing::SegmentSpacing> {
+        if let Some(s) = self
+            .measured
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&idx)
+        {
+            return *s;
+        }
+        let spacing = match self.segment(idx) {
+            Ok(Some(seg)) => {
+                let mut ts = seg.sample_timestamps();
+                ts.sort_unstable();
+                ts.dedup();
+                crate::spacing::segment_spacing(&ts)
+            }
+            Ok(None) => None,
+            Err(e) => {
+                tracing::warn!(segment = idx, error = %e, "measuring a segment's spacing");
+                None
+            }
+        };
+        self.measured
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(idx, spacing);
+        spacing
     }
 
     /// Number of segments backing this source, gone ones included.
