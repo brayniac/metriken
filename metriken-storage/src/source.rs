@@ -142,6 +142,19 @@ pub trait DataSource: Send + Sync {
         let _ = name;
         self.interval()
     }
+    /// The longest gap, in seconds, between rows of the table holding
+    /// `name` over the range being read, where the source knows it; 0 where
+    /// it does not (the default). The query engine reads a series from the
+    /// longer of this and the interval before a range, and bounds how far a
+    /// `rate` reaches, how long a gauge is held and how far apart a raw pair
+    /// may be by it, each within the spacing of the rows near a point. It is
+    /// not the interval: a step or a lookback that follows the interval
+    /// does not take it. `LabeledSource::with_row_gap_bound` sets it; a
+    /// source joining others answers the holding one's.
+    fn row_gap_bound(&self, name: &str) -> f64 {
+        let _ = name;
+        0.0
+    }
     /// Full time extent of the stored data in nanoseconds, or `None` if empty.
     fn time_range(&self) -> Option<(u64, u64)>;
     /// Names of all counter metrics (sorted, deduplicated).

@@ -21,9 +21,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   interpolated from), a gauge's hold past its latest sample and the longest
   pair raw `irate` gives a value for are two, one and four of the spacing of
   the samples around the point, and at most two intervals, the step or the
-  interval, and four intervals. Over an `ArchiveReader` a table's interval
-  is the larger of its probed one and the longest gap between rows its
-  segments record over the query's range (`SamplerReader::spacing_over`). A table
+  interval (or its `row_gap_bound` when longer), and four intervals. Over an
+  `ArchiveReader` a table's `row_gap_bound` is the longest gap between its
+  rows over the query's range, from what its segments record and the gaps
+  between segments (`SamplerReader::spacing_over`); the table's interval,
+  which sets an instant query's step and a histogram's lookback, is still
+  the probed one. A pause in a table therefore lengthens how far back it is
+  read and nothing else. A table
   probed at 100 ms (the median of its first rows, or a catalog's mean gap)
   that later reads every 1 s is now exact: upstream, at a 100 ms step, a
   `rate(x[10s])` window starting in the 1 s span started late (70 of 140
@@ -42,7 +46,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   returns those points. It compared one median gap per table: a table read
   every 1 s with a 100 ms stretch, beside a 1 s table, was evaluated at the
   1 s rows everywhere, and a table going from 100 ms to 1 s rows beside a
-  100 ms table was evaluated on the grid throughout. Without a range,
+  100 ms table was evaluated on the grid throughout. A table with no rows
+  over a span (before its first, after its last, in a hole) keeps the
+  spacing of its nearest rows there, so past a slow table's last row a query
+  has no points rather than the grid with the slow value held forward.
+  Without a range,
   `eval_timestamps_for` fills the grid spans across the tables' extent, so a
   fine step over a long recording is that many points.
 - Documented in the crate docs: `avg_over_time` is a mean over samples, as
@@ -57,7 +65,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   gauge. An archive written before segments recorded their spacing measures
   each segment a query reaches once, from its timestamps: about 10 ms more on
   the first query of a 1 s table over 9.6 h.
-- Needs metriken-storage 0.4.1 (`spacing`, `SamplerReader::spacing_over`).
+- Needs metriken-storage 0.4.1 (`spacing`, `SamplerReader::spacing_over`,
+  `DataSource::row_gap_bound`): the release PR raises this crate's
+  requirement, `metriken-storage = { version = "0.4.0" }`, to 0.4.1.
 
 ### metriken-storage 0.4.1
 
@@ -75,8 +85,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   index is not the 12-byte names fingerprint to hold the first segment's
   names, so a longer record would hide metric names that first appear in a
   later segment.
+- A reader up to 0.4.0 exposes the key as table metadata
+  (`metadata_get("metriken.spacing")`, `file_metadata`), the last segment's
+  value; it reads nothing from it.
 - Added `SegmentedSource::spacing_over` and `SamplerReader::spacing_over`:
-  the row spacing of a table's segments over a range, from their footers. A
+  the row spacing of a table's segments over a range, from their footers,
+  with the gap from each of those segments to the one before and after it
+  (from the catalog spans already in memory; a seal, or a part of a split
+  seal, ends a segment wherever the rows are, so that gap is in neither
+  footer). A
   segment sealed before the key is measured from its timestamps the first
   time a range reaches it, and the measurement kept for the reader's life;
   that decodes its `timestamp` column once (a long segment's holds a row per
@@ -89,6 +106,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `GroupTableBuilder::row_gaps` report what a builder has kept.
 - A table's merged file metadata leaves the spacing key out: it describes
   one segment.
+- Added `DataSource::row_gap_bound` (defaulted to 0) and
+  `LabeledSource::with_row_gap_bound`: the longest gap between a table's
+  rows over the range read, which the query engine reads back and bounds by
+  without taking it as the interval. `UnionSource` answers the holding
+  table's, `RecordingsSource` the longest of its recordings'.
 - `DataSource::gauge_parts`'s documentation says how long the engine holds a
   gauge (the step, or the spacing around the point when longer, at most the
   interval).

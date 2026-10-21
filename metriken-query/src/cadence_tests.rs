@@ -466,7 +466,7 @@ const RATES: [&str; 5] = [
 /// the truth on every point, at the coarse hint and through archives whose
 /// probed interval is the fine 100 ms or 250 ms: there a table's interval
 /// is at least the longest row gap its segments record (or, without the record,
-/// measure). Upstream, rows that start fine lost the band on every point of
+/// measure). Before 0.42.0, rows that start fine lost the band on every point of
 /// the coarse span, and at a fine probed interval a `rate` window starting
 /// in a coarse span started late (70 of 140 points wrong near the change,
 /// 4.9%).
@@ -490,7 +490,7 @@ fn irate_is_exact_and_banded_at_a_declared_fine_interval() {
     report.assert();
 }
 
-/// S10: a gauge is held to the next row at every grid point. Upstream, at a
+/// S10: a gauge is held to the next row at every grid point. Before 0.42.0, at a
 /// fine probed interval, it dropped every point more than 100 ms past a
 /// coarse row (800 of 1601 at a 100 ms step).
 #[test]
@@ -519,7 +519,7 @@ fn rows_in_range(ts: &[u64]) -> Vec<u64> {
         .collect()
 }
 
-/// S10: raw `irate` gives the rate at every row. Upstream, at a 100 ms
+/// S10: raw `irate` gives the rate at every row. Before 0.42.0, at a 100 ms
 /// probed interval, it gave no value for any 1 s pair.
 #[test]
 fn raw_irate_gives_every_pair_at_any_archive_hint() {
@@ -545,7 +545,7 @@ fn raw_irate_gives_every_pair_at_any_archive_hint() {
 /// whose edges fall in it, while the coarse spans keep theirs; the gauge is
 /// not held across it; raw `irate` gives no value for the pair spanning it.
 /// The hint (1 s) is coarser than the hole, so only the local spacing can
-/// find it. Upstream the band was kept, the gauge held for the second, and
+/// find it. Before 0.42.0 the band was kept, the gauge held for the second, and
 /// the pair given a value.
 #[test]
 fn a_gap_inside_the_fine_span_is_a_hole() {
@@ -597,7 +597,7 @@ fn a_gap_inside_the_fine_span_is_a_hole() {
     // A `rate` whose window starts inside the hole, more than two 100 ms
     // spacings after the row before it, starts it at the row after the hole,
     // as across any hole: a counter that jumps by 1000 at that row reads
-    // 10/s, not a share of the jump. Upstream the reach was two of the 1 s
+    // 10/s, not a share of the jump. Before 0.42.0 the reach was two of the 1 s
     // hint and the window was interpolated across the hole.
     let st = MemoryStore::builder().sampling_interval_ms(1000).build();
     st.insert_counter_series(
@@ -627,7 +627,7 @@ type Bits = (u64, u64, Option<(u64, u64)>);
 
 /// A rate at one time has one value and one band from any start, through
 /// the changes of spacing and at every hint: the local bounds reach no
-/// further back than the read does. Upstream the bands differed (a range
+/// further back than the read does. Before 0.42.0 the bands differed (a range
 /// starting in the fine span took its hole test from fine samples).
 #[test]
 fn rates_through_a_change_of_spacing_are_the_same_from_any_start() {
@@ -638,7 +638,8 @@ fn rates_through_a_change_of_spacing_are_the_same_from_any_start() {
             for per_series in [false, true] {
                 let opts = QueryOptions::default().with_per_series_rates(per_series);
                 for q in ["irate(c2[5s])", "rate(c2[10s])", "rate(c2[60s])"] {
-                    let range = |start: f64| -> Vec<Bits> {
+                    // The points from `from` on of a range starting at `start`.
+                    let range = |start: f64, from: f64| -> Vec<Bits> {
                         let r = src.query_range_opts(q, start, END, 0.1, &opts).unwrap();
                         let QueryResult::Matrix { result } = r else {
                             panic!()
@@ -647,7 +648,7 @@ fn rates_through_a_change_of_spacing_are_the_same_from_any_start() {
                         m.values
                             .iter()
                             .enumerate()
-                            .filter(|(_, (t, _))| *t >= 1135.0)
+                            .filter(|(_, (t, _))| *t >= from - 1e-6)
                             .map(|(i, &(t, v))| {
                                 let b = m.bands.as_ref().and_then(|b| b[i]);
                                 (
@@ -658,12 +659,16 @@ fn rates_through_a_change_of_spacing_are_the_same_from_any_start() {
                             })
                             .collect()
                     };
-                    let early = range(START);
-                    assert!(!early.is_empty());
-                    for start in [1061.0, 1119.5, 1121.0, 1135.0] {
+                    // 1135.5: the first windows' left edges fall between two
+                    // 1 s rows, and the row before each is read only when the
+                    // read reaches back as far as the rows are apart.
+                    for start in [1061.0, 1119.5, 1121.0, 1135.0, 1135.5] {
+                        let from = f64::max(start, 1135.0);
+                        let early = range(START, from);
+                        assert!(!early.is_empty());
                         assert_eq!(
                             early,
-                            range(start),
+                            range(start, from),
                             "{fixture} {name} per_series {per_series} {q} from {start}"
                         );
                     }
@@ -853,4 +858,262 @@ fn per_row_and_per_sample_functions_are_as_documented() {
         .collect();
     let mean = in_window.iter().sum::<f64>() / in_window.len() as f64;
     assert!((at.v - mean).abs() < 1e-9, "{} vs {mean}", at.v);
+}
+
+// ───────────────────────── a pause in a table ─────────────────────────
+
+/// Counter `pc`: 10/s to 760 s past `T0`, then 100/s. Gauge `pg`: seconds
+/// past `T0`, absent after `g_ends` when it is set.
+fn pause_segment(ts: &[u64], g_ends: Option<u64>) -> Vec<u8> {
+    let pc = |t: u64| {
+        let s = (t - T0) / S;
+        if s <= 760 {
+            s * 10
+        } else {
+            7600 + (s - 760) * 100
+        }
+    };
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("timestamp", DataType::UInt64, false),
+        Field::new(":window_begin", DataType::Int64, true),
+        Field::new(":window_width", DataType::UInt64, true),
+        field("pc", "counter", DataType::UInt64),
+        field("pg", "gauge", DataType::Int64),
+    ]));
+    let cols: Vec<ArrayRef> = vec![
+        Arc::new(UInt64Array::from(ts.to_vec())),
+        Arc::new(Int64Array::from(vec![-(MS as i64); ts.len()])),
+        Arc::new(UInt64Array::from(vec![2 * MS; ts.len()])),
+        Arc::new(UInt64Array::from(
+            ts.iter().map(|&t| pc(t)).collect::<Vec<_>>(),
+        )),
+        Arc::new(Int64Array::from(
+            ts.iter()
+                .map(|&t| (!g_ends.is_some_and(|e| t > e)).then(|| ((t - T0) / S) as i64))
+                .collect::<Vec<_>>(),
+        )),
+    ];
+    let mut buf = Vec::new();
+    let mut w = ArrowWriter::try_new(&mut buf, schema.clone(), None).unwrap();
+    w.write(&RecordBatch::try_new(schema, cols).unwrap())
+        .unwrap();
+    w.close().unwrap();
+    buf
+}
+
+/// Rows every second from 0 to 100 s and from 700 to 800 s past `T0`: a
+/// ten-minute pause, which is the table's longest gap.
+fn paused_rows() -> Vec<u64> {
+    let mut ts: Vec<u64> = (0..=100).map(|i| T0 + i * S).collect();
+    ts.extend((700..=800).map(|i| T0 + i * S));
+    ts
+}
+
+fn instant(src: &dyn MetricsSource, q: &str, t: u64) -> Vec<f64> {
+    match src.query(q, Some(t as f64 / 1e9)).unwrap() {
+        QueryResult::Vector { result } => result.iter().map(|s| s.value.1).collect(),
+        r => panic!("{q}: {r:?}"),
+    }
+}
+
+/// A pause lengthens how far back a table is read, and nothing else: an
+/// instant query still steps at the table's interval (1 s), so a gauge is
+/// not held into the pause or past its own last row, and `irate` at the end
+/// is the last pair's rate. A bound taken as the interval would
+/// make the pause's 600 s the instant step, and each of these read
+/// otherwise. One segment and two (the
+/// pause between them).
+#[test]
+fn a_pause_lengthens_the_read_not_the_step() {
+    let ts = paused_rows();
+    let (before, after): (Vec<u64>, Vec<u64>) = ts.iter().partition(|&&t| t <= T0 + 100 * S);
+    for (name, reader) in [
+        (
+            "one segment",
+            archive(vec![("s/grp", vec![pause_segment(&ts, None)])]),
+        ),
+        (
+            "two segments",
+            archive(vec![(
+                "s/grp",
+                vec![pause_segment(&before, None), pause_segment(&after, None)],
+            )]),
+        ),
+    ] {
+        assert_eq!(
+            instant(&reader, "pg", T0 + 400 * S),
+            Vec::<f64>::new(),
+            "{name}"
+        );
+        assert_eq!(instant(&reader, "pg", T0 + 800 * S), vec![800.0], "{name}");
+        for q in ["irate(pc[5m])", "irate(pc[1m])", "rate(pc[30s])"] {
+            let v = instant(&reader, q, T0 + 800 * S);
+            assert_eq!(v.len(), 1, "{name} {q}");
+            assert!((v[0] - 100.0).abs() < 1e-6, "{name} {q}: {v:?}");
+        }
+    }
+    // A gauge that stops at 760 s in a table that goes on to 800 s.
+    let stopped = archive(vec![(
+        "s/grp",
+        vec![pause_segment(&ts, Some(T0 + 760 * S))],
+    )]);
+    assert_eq!(instant(&stopped, "pg", T0 + 800 * S), Vec::<f64>::new());
+    assert_eq!(instant(&stopped, "pg", T0 + 760 * S), vec![760.0]);
+}
+
+/// The range control: a `rate` over the pause is the same on both paths,
+/// and right away from the pause's edges.
+#[test]
+fn a_rate_across_a_pause_is_right_on_both_paths() {
+    let ts = paused_rows();
+    let reader = archive(vec![("s/grp", vec![pause_segment(&ts, None)])]);
+    let pc = |t: u64| -> f64 {
+        let s = (t - T0) as f64 / 1e9;
+        if s <= 760.0 {
+            s * 10.0
+        } else {
+            7600.0 + (s - 760.0) * 100.0
+        }
+    };
+    let mut answers = Vec::new();
+    for per_series in [false, true] {
+        let opts = QueryOptions::default().with_per_series_rates(per_series);
+        let r = reader
+            .query_range_opts("rate(pc[1m])", 1050.0, 1790.0, 10.0, &opts)
+            .unwrap();
+        let QueryResult::Matrix { result } = r else {
+            panic!()
+        };
+        let points: Vec<(u64, f64)> = result[0]
+            .values
+            .iter()
+            .map(|&(t, v)| ((t * 1e9).round() as u64, v))
+            .collect();
+        for &(t, v) in &points {
+            let edge = (T0 + 60 * S..=T0 + 100 * S).contains(&t)
+                || (T0 + 760 * S..=T0 + 790 * S).contains(&t);
+            if edge {
+                let want = (pc(t) - pc(t - 60 * S)) / 60.0;
+                assert!(
+                    (v - want).abs() < 1e-6,
+                    "per_series {per_series} at {t}: {v} vs {want}"
+                );
+            }
+        }
+        assert!(points.iter().filter(|(t, _)| *t >= T0 + 760 * S).count() >= 3);
+        answers.push(format!("{points:?}"));
+    }
+    assert_eq!(answers[0], answers[1]);
+}
+
+/// S11 at the ends of a slow table: past its last row, and inside a hole of
+/// it, a query across it and a fast table has no points rather than the
+/// fast table's grid with the slow operand held forward.
+#[test]
+fn past_a_slow_tables_last_row_there_are_no_grid_points() {
+    let slow = |rows: &[u64]| -> Vec<u8> {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("timestamp", DataType::UInt64, false),
+            field("other", "counter", DataType::UInt64),
+        ]));
+        let cols: Vec<ArrayRef> = vec![
+            Arc::new(UInt64Array::from(rows.to_vec())),
+            Arc::new(UInt64Array::from(
+                rows.iter()
+                    .map(|&t| c_const(t).round() as u64)
+                    .collect::<Vec<_>>(),
+            )),
+        ];
+        let mut buf = Vec::new();
+        let mut w = ArrowWriter::try_new(&mut buf, schema.clone(), None).unwrap();
+        w.write(&RecordBatch::try_new(schema, cols).unwrap())
+            .unwrap();
+        w.close().unwrap();
+        buf
+    };
+    let fast: Vec<u64> = (T0..=TEND).step_by(S as usize).collect();
+    let q = "irate(c[5s]) + irate(other[5s])";
+    // 10 s rows to 1100 s.
+    let ends: Vec<u64> = (T0..=1100 * S).step_by(10 * S as usize).collect();
+    // 10 s rows with nothing from 1050 to 1120 s.
+    let holed: Vec<u64> = ends
+        .iter()
+        .copied()
+        .chain((1120 * S..=TEND).step_by(10 * S as usize))
+        .filter(|&t| !(1050 * S < t && t < 1120 * S))
+        .collect();
+    for (name, rows) in [
+        ("ends at 1100 s", ends.clone()),
+        ("hole 1050-1120 s", holed.clone()),
+    ] {
+        let reader = archive(vec![
+            ("s/grp", vec![segment(&fast, None)]),
+            ("t", vec![slow(&rows)]),
+        ]);
+        let points = crate::eval_timestamps_for(&reader, q, 1.0, RateMode::Grid).unwrap();
+        assert_eq!(&points[..], &rows[..], "{name}");
+    }
+}
+
+/// The read-back reaches as far as the rows are apart through every way an
+/// archive joins tables: a query over two group tables of one recording (a
+/// union) and an archive of two recordings. A range starting at 1135.5 s, whose first
+/// windows' left edges fall between 1 s rows, answers as one starting
+/// earlier.
+#[test]
+fn the_read_back_covers_the_rows_through_unions_and_recordings() {
+    let ts = coarse_fine_coarse();
+    let recording = |name: &str| {
+        let labels: BTreeMap<String, String> = [("source".to_string(), name.to_string())].into();
+        InMemorySource {
+            name: name.into(),
+            metadata: labels.clone(),
+            labels,
+            complete: true,
+            tables: vec![
+                ("s/grp".to_string(), vec![segment(&ts, None)]),
+                ("s/other".to_string(), vec![steady(1000)]),
+            ],
+        }
+    };
+    let union =
+        ArchiveReader::from_in_memory(vec![recording("a")], None, BufferPool::new(64 << 20))
+            .unwrap();
+    let two = ArchiveReader::from_in_memory(
+        vec![recording("a"), recording("b")],
+        None,
+        BufferPool::new(64 << 20),
+    )
+    .unwrap();
+    for (name, reader) in [("union", union), ("two recordings", two)] {
+        for per_series in [false, true] {
+            let opts = QueryOptions::default().with_per_series_rates(per_series);
+            let points = |start: f64| -> Vec<String> {
+                let r = reader
+                    .query_range_opts("rate(c2[10s]) + rate(other[10s])", start, END, 0.1, &opts)
+                    .unwrap();
+                let QueryResult::Matrix { result } = r else {
+                    panic!()
+                };
+                result
+                    .iter()
+                    .map(|m| {
+                        let kept: Vec<_> = m
+                            .values
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, (t, _))| *t >= 1135.5 - 1e-6)
+                            .map(|(i, &(t, v))| (t, v, m.bands.as_ref().and_then(|b| b[i])))
+                            .collect();
+                        format!("{kept:?}")
+                    })
+                    .collect()
+            };
+            assert_eq!(
+                points(START),
+                points(1135.5),
+                "{name} per_series {per_series}"
+            );
+        }
+    }
 }

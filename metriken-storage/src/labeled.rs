@@ -123,6 +123,7 @@ pub struct LabeledSource {
     inner: Arc<dyn DataSource>,
     extra: Labels,
     interval: Option<f64>,
+    gap_bound: Option<f64>,
 }
 
 impl LabeledSource {
@@ -131,6 +132,29 @@ impl LabeledSource {
             inner,
             extra,
             interval: None,
+            gap_bound: None,
+        }
+    }
+
+    /// Report `bound` (seconds) as [`row_gap_bound`](DataSource::row_gap_bound):
+    /// the longest gap between the table's rows over the range a query reads.
+    /// Each counter series it returns carries the longer of it and the
+    /// interval as its interval, which bounds how far a `rate` reaches
+    /// (`CounterStream::interval`), and gauges are read and held to the longer
+    /// of the two ([`gauge_parts`](DataSource::gauge_parts)).
+    /// [`interval`](DataSource::interval) and the per-kind intervals are not
+    /// changed.
+    pub fn with_row_gap_bound(mut self, bound: f64) -> Self {
+        self.gap_bound = Some(bound).filter(|b| *b > 0.0);
+        self
+    }
+
+    /// The interval a series carries: the interval, or the gap bound when
+    /// that is longer.
+    fn series_interval(&self) -> Option<f64> {
+        match (self.interval, self.gap_bound) {
+            (Some(i), Some(b)) => Some(i.max(b)),
+            (i, b) => i.or(b),
         }
     }
 
@@ -196,10 +220,11 @@ impl DataSource for LabeledSource {
         let mut streams = self
             .inner
             .counter_streams(name, &inner_filter, start_ns, end_ns)?;
+        let interval = self.series_interval();
         for s in &mut streams {
             self.relabel(&mut s.labels);
-            if self.interval.is_some() {
-                s.interval = self.interval;
+            if interval.is_some() {
+                s.interval = interval;
             }
         }
         streams.retain(|s| keeps(&s.labels, &self.extra, filter));
@@ -244,10 +269,11 @@ impl DataSource for LabeledSource {
         let mut scan = self
             .inner
             .counter_scan(name, &inner_filter, start_ns, end_ns)?;
+        let interval = self.series_interval();
         for s in &mut scan.series {
             self.relabel(&mut s.labels);
-            if self.interval.is_some() {
-                s.interval = self.interval;
+            if interval.is_some() {
+                s.interval = interval;
             }
         }
         // A scan's series are positions in its chunks, so one cannot be
@@ -275,8 +301,9 @@ impl DataSource for LabeledSource {
         (!gauges.series.is_empty()).then_some(gauges)
     }
 
-    /// With an interval set, the gauges as one part at that interval; else
-    /// the source's parts, relabelled.
+    /// With an interval set, the gauges as one part at that interval, or at
+    /// the gap bound when that is longer; else the source's parts,
+    /// relabelled.
     fn gauge_parts(
         &self,
         name: &str,
@@ -285,7 +312,7 @@ impl DataSource for LabeledSource {
         end_ns: u64,
         step_ns: u64,
     ) -> Option<Vec<(Gauges, f64)>> {
-        if let Some(interval) = self.interval {
+        if let Some(interval) = self.interval.and(self.series_interval()) {
             let lookback_ns = step_ns.max((interval * 1e9) as u64);
             let gauges = self.gauges(name, filter, start_ns.saturating_sub(lookback_ns), end_ns)?;
             return Some(vec![(gauges, interval)]);
@@ -355,6 +382,11 @@ impl DataSource for LabeledSource {
     fn gauge_interval(&self, name: &str) -> f64 {
         self.interval
             .unwrap_or_else(|| self.inner.gauge_interval(name))
+    }
+
+    fn row_gap_bound(&self, name: &str) -> f64 {
+        self.gap_bound
+            .unwrap_or_else(|| self.inner.row_gap_bound(name))
     }
 
     /// The keys this adds, and the source's own.

@@ -1,28 +1,39 @@
 //! The spacing of a series' samples near a point, which the engine's
 //! per-point bounds are taken from.
 //!
-//! Four bounds depend on how far apart a series' samples are: how far
-//! before a `rate`'s window a sample is interpolated from (the reach, two
-//! spacings), how long a gauge is held past a sample (the step, or one
-//! spacing when that is longer), the longest pair a raw `irate` gives a
-//! value for (four spacings), and which gaps a rate's band treats as holes
-//! (longer than two spacings). They used to come from one interval hint per
-//! table, or from the first nine samples, which is wrong for any series
-//! whose spacing changes: at a 100 ms hint a 1 s span read as holes, and at
-//! a 1 s hint a gap inside a 100 ms span did not.
-//!
-//! Each now takes the spacing of the pair of samples around the point
-//! (`metriken_storage::spacing::local_spacing`, which defines it:
+//! The spacing of a pair of consecutive samples is the larger of the median
+//! of up to eight gaps before the pair and the median of up to eight after it
+//! (`metriken_storage::spacing::local_spacing`;
 //! `docs/journal/2026-10-19-recording-identity-and-views.md`, S3 and S10).
-//! The reach, the gauge's hold and the raw pair's gap are no longer than
-//! the hint gives, because a read starts that far before the range: a bound
-//! past it would reach samples a later start does not read, and a result
-//! would depend on where its range starts. An archive table's hint is at
-//! least the longest gap between rows its segments record over the query's
-//! window (`archive::timed`), so there the cap does not bind; a source whose
-//! hint is finer than its rows (a `MemoryStore` declaring 100 ms over 1 s
-//! rows) is still held to it. The hole test has no cap: it only decides
+//! Four bounds are taken from the pair around a point:
+//!
+//! * a `rate`'s reach, how far before its window's left edge a sample is
+//!   interpolated from: two spacings;
+//! * a gauge's hold past its latest sample: the step, or one spacing when
+//!   that is longer;
+//! * the longest pair raw `irate` gives a value for: four spacings;
+//! * a hole, which a rate's band is not taken across: a gap longer than two
+//!   spacings.
+//!
+//! The first three are at most what the source's interval, or its
+//! `row_gap_bound` when longer, gives (two, one and four of it), because a
+//! read starts that far before the range: a bound past it would reach
+//! samples a later start does not read, and a result would depend on where
+//! its range starts. An archive table's `row_gap_bound` is the longest gap
+//! between its rows over the query's window, from what its segments record
+//! and the gaps between them (`archive::timed`), and no spacing taken over
+//! those rows is longer, so there the cap binds only for a spacing whose
+//! eight gaps reach rows outside the window. A source with no bound and an
+//! interval finer than its rows (a `MemoryStore` declaring 100 ms over 1 s
+//! rows) is held to the interval. The hole test has no cap: it only decides
 //! whether a point has a band.
+//!
+//! Taking the larger median keeps a series that slows down (100 ms rows,
+//! then 1 s rows) from showing holes after the change, and has a cost: within
+//! eight rows of a slowdown a gap is measured against the slow side, so with
+//! 100 ms rows, a 1.5 s gap, three more 100 ms rows and then 1 s rows, the
+//! 1.5 s gap is not a hole
+//! (`metriken_storage::spacing::tests::a_hole_just_before_a_slowdown_is_measured_against_the_slow_side`).
 
 use std::cell::Cell;
 use std::collections::VecDeque;

@@ -23,8 +23,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   index is not the 12-byte names fingerprint to hold the first segment's
   names, so a longer record would hide metric names that first appear in a
   later segment.
+- A reader up to 0.4.0 exposes the key as table metadata
+  (`metadata_get("metriken.spacing")`, `file_metadata`), the last segment's
+  value; it reads nothing from it.
 - Added `SegmentedSource::spacing_over` and `SamplerReader::spacing_over`:
-  the row spacing of a table's segments over a range, from their footers. A
+  the row spacing of a table's segments over a range, from their footers,
+  with the gap from each of those segments to the one before and after it
+  (from the catalog spans already in memory; a seal, or a part of a split
+  seal, ends a segment wherever the rows are, so that gap is in neither
+  footer). A
   segment sealed before the key is measured from its timestamps the first
   time a range reaches it, and the measurement kept for the reader's life;
   that decodes its `timestamp` column once (a long segment's holds a row per
@@ -37,6 +44,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `GroupTableBuilder::row_gaps` report what a builder has kept.
 - A table's merged file metadata leaves the spacing key out: it describes
   one segment.
+- Added `DataSource::row_gap_bound` (defaulted to 0) and
+  `LabeledSource::with_row_gap_bound`: the longest gap between a table's
+  rows over the range read, which the query engine reads back and bounds by
+  without taking it as the interval. `UnionSource` answers the holding
+  table's, `RecordingsSource` the longest of its recordings'.
 - `DataSource::gauge_parts`'s documentation says how long the engine holds a
   gauge (the step, or the spacing around the point when longer, at most the
   interval).

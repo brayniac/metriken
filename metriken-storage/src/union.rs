@@ -205,6 +205,18 @@ impl DataSource for UnionSource {
         }
     }
 
+    /// The holding table's.
+    fn row_gap_bound(&self, name: &str) -> f64 {
+        [
+            &self.counter_index,
+            &self.gauge_index,
+            &self.histogram_index,
+        ]
+        .iter()
+        .find_map(|index| index.get(name))
+        .map_or(0.0, |i| self.children[*i].row_gap_bound(name))
+    }
+
     /// The finest (minimum) interval across children: the default step
     /// tracks the fastest-ticking child.
     fn interval(&self) -> f64 {

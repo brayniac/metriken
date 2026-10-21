@@ -214,6 +214,14 @@ impl DataSource for RecordingsSource {
             .unwrap_or_else(|| self.interval())
     }
 
+    /// The longest of the bounds of the recordings.
+    fn row_gap_bound(&self, name: &str) -> f64 {
+        self.children
+            .iter()
+            .map(|c| c.row_gap_bound(name))
+            .fold(0.0, f64::max)
+    }
+
     /// The longest of the intervals of the recordings holding `name`.
     fn gauge_interval(&self, name: &str) -> f64 {
         self.children

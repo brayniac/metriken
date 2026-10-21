@@ -379,6 +379,27 @@ mod tests {
         }
     }
 
+    /// The larger median's cost: within eight rows of a slowdown a hole is
+    /// measured against the slower side. 100 ms rows, a 1.5 s gap, three
+    /// more 100 ms rows, then 1 s rows: the eight gaps after the 1.5 s one
+    /// are three of 100 ms and five of 1 s, so its spacing is 1 s and 1.5 s
+    /// is not a hole.
+    #[test]
+    fn a_hole_just_before_a_slowdown_is_measured_against_the_slow_side() {
+        let mut ts: Vec<u64> = (0..=20).map(|i| i * 100).collect();
+        ts.extend([3500, 3600, 3700, 3800]);
+        ts.extend((1..=10).map(|i| 3800 + i * 1000));
+        let hi = ts.iter().position(|&t| t == 3500).unwrap();
+        assert_eq!(local_spacing(|i| ts[i], ts.len(), hi), Some(1000));
+        let hole = pair_spacings(&ts)[hi - 1];
+        assert_eq!(hole, (hi, Some(1000)), "a 1.5 s gap is not a hole here");
+        // Without the slowdown after it, the same gap is one.
+        let mut fine: Vec<u64> = (0..=20).map(|i| i * 100).collect();
+        fine.extend((0..20).map(|i| 3500 + i * 100));
+        let hi = fine.iter().position(|&t| t == 3500).unwrap();
+        assert_eq!(pair_spacings(&fine)[hi - 1], (hi, None));
+    }
+
     /// Two rows at one time are not a spacing; an even count takes the
     /// upper middle.
     #[test]

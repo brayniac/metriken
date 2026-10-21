@@ -201,13 +201,19 @@ fn raw_read_back(ctx: &Ctx<'_>, window_ns: u64) -> u64 {
 
 /// How far before a `rate(name[range])` window's left edge a sample is
 /// interpolated from at most, for a series that does not carry its table's
-/// interval: two of `counter_interval`, which no series of the source
-/// exceeds (`DataSource::counter_interval`). Within it the reach is two of
+/// interval: two of the longer of `counter_interval` and `row_gap_bound`,
+/// which no series of the source exceeds (`DataSource::counter_interval`,
+/// `LabeledSource::with_row_gap_bound`). Within it the reach is two of
 /// the spacing of the samples around the edge (`range_start`), and a window
 /// with no sample that close before its left edge starts at the first
 /// sample after it.
 fn rate_reach(ctx: &Ctx<'_>, name: &str) -> u64 {
-    crate::batch_rate::interval_reach(ctx.source.counter_interval(name))
+    let source = ctx.source;
+    crate::batch_rate::interval_reach(
+        source
+            .counter_interval(name)
+            .max(source.row_gap_bound(name)),
+    )
 }
 
 /// How far before a `rate(name[range])` point's time its read starts: the

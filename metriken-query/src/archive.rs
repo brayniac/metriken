@@ -314,11 +314,23 @@ fn cross_cadence(
     cuts.sort_unstable();
     cuts.dedup();
     let mut cursor = vec![0usize; tables.len()];
+    // Each table's spacing in its last run with one, so far: what it keeps
+    // where no run of its has a spacing (past its last row, in a hole). A
+    // table whose first such run is ahead keeps that one's until then.
+    let mut last: Vec<Option<u64>> = tables
+        .iter()
+        .map(|(_, runs)| runs.iter().find_map(|r| r.spacing))
+        .collect();
     let mut spans: Vec<(u64, u64, Option<usize>)> = Vec::new();
     let mut any = false;
     for w in cuts.windows(2) {
         let (a, b) = (w[0], w[1]);
-        // Each sampler's cadence over [a, b): its densest table's there.
+        // Each sampler's cadence over [a, b): its densest table's there. A
+        // table with no run with a spacing over the span (before its first
+        // row, after its last, in a hole) keeps its nearest run's, so its
+        // sampler is still compared and a span past a slow table's last row
+        // stays on that table's rows (none) rather than reverting to the
+        // grid with the slow operand held forward.
         let mut cadence: Vec<(u64, usize)> = Vec::new();
         for members in samplers.values() {
             let mut densest: Option<(u64, usize)> = None;
@@ -327,10 +339,16 @@ fn cross_cadence(
                 while cursor[i] < runs.len() && runs[cursor[i]].to <= a {
                     cursor[i] += 1;
                 }
-                let Some(r) = runs.get(cursor[i]).filter(|r| r.from <= a) else {
+                let here = runs
+                    .get(cursor[i])
+                    .filter(|r| r.from <= a)
+                    .and_then(|r| r.spacing);
+                if here.is_some() {
+                    last[i] = here;
+                }
+                let Some(gap) = here.or(last[i]) else {
                     continue;
                 };
-                let Some(gap) = r.spacing else { continue };
                 if densest.is_none_or(|(d, _)| gap < d) {
                     densest = Some((gap, i));
                 }
@@ -622,18 +640,18 @@ fn refuse_kinds_across_recordings(
 /// was not measured (one row). A segment that declares no interval reports
 /// 1 s, which would hold a 10 s table's gauge 1 s past each row.
 ///
-/// Over a query `window`, the interval is the larger of the probed one and
-/// the longest gap between the table's rows there, which its segments record
-/// (`SamplerReader::spacing_over`). A rate's reach, a gauge's hold and a raw
-/// pair's gap are each the spacing of the rows near a point, capped at what
-/// the interval gives, because a read starts that far before a range
-/// (`promql::streaming::spacing`); no spacing exceeds the longest gap, so
-/// the cap does not bind. The probed interval of a table whose spacing
-/// changes is the median of its first rows or its mean gap, and the cap at it
-/// read a 1 s span of a table probed at 100 ms as holes. A hole in the window
-/// lengthens the read-back by four of its length, not the answer. The window
-/// is widened by four of the interval (a rate's read-back) and measured again
-/// once if that finds a longer gap.
+/// Over a query `window`, the source also reports the longest gap between
+/// the table's rows there ([`DataSource::row_gap_bound`], from what its
+/// segments record and the gaps between them;
+/// `SamplerReader::spacing_over`). The engine reads a series from that far
+/// before a range and bounds a rate's reach, a gauge's hold and a raw pair's
+/// gap by it, each within the spacing of the rows near a point
+/// (`promql::streaming::spacing`). The interval, which sets an instant
+/// query's step and a histogram's lookback, stays the probed one. The window
+/// is widened by four of the interval (a rate's read-back) and measured
+/// again once if that finds a longer gap. A pause in the window makes the
+/// read-back that much longer; the spacing near each point still decides,
+/// so a point in the pause is no more held or interpolated than before.
 fn timed(
     table: &SamplerReader,
     reader: &TableReader,
@@ -649,19 +667,19 @@ fn timed(
             .spacing_over(start.saturating_sub(reach), end.saturating_add(reach))
             .map(|s| s.max_gap as f64 / 1e9)
     };
-    let measured = longest(probed.unwrap_or(0.0)).map(|first| {
+    let bound = longest(probed.unwrap_or(0.0)).map(|first| {
         if first > probed.unwrap_or(0.0) {
             longest(first).map_or(first, |again| again.max(first))
         } else {
             first
         }
     });
-    let interval = match (probed, measured) {
-        (Some(p), Some(m)) => Some(p.max(m)),
-        (p, m) => p.or(m),
+    let source = match probed {
+        Some(i) => source.with_interval(i),
+        None => source,
     };
-    match interval {
-        Some(i) => Arc::new(source.with_interval(i)),
+    match bound {
+        Some(b) => Arc::new(source.with_row_gap_bound(b)),
         None => Arc::new(source),
     }
 }

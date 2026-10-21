@@ -989,7 +989,8 @@ impl SegmentedSource {
     }
 
     /// The row spacing of the segments that hold rows in `[start_ns,
-    /// end_ns]`, merged ([`crate::spacing::merge_spacing`]): from each
+    /// end_ns]`, merged ([`crate::spacing::merge_spacing`]) with the gaps
+    /// from each of them to the segment before and after it: from each
     /// segment's footer, or, for a segment whose footer records none (one
     /// sealed before the key), measured from its timestamps the first time
     /// it is asked and kept. Measuring decodes the segment's `timestamp`
@@ -1001,8 +1002,32 @@ impl SegmentedSource {
         end_ns: u64,
     ) -> Option<crate::spacing::SegmentSpacing> {
         let mut out = None;
+        // The last present segment before this one: its span, and whether
+        // the range touches it.
+        let mut prev: Option<((u64, u64), bool)> = None;
         for (idx, c) in self.state.catalog.iter().enumerate() {
-            if !c.touches(start_ns, end_ns) {
+            let touches = c.touches(start_ns, end_ns);
+            // The gap from the last row of one segment to the first of the
+            // next is in neither's footer (a seal, or one part of a split
+            // seal, ends a segment wherever the rows are).
+            if let (Some(((_, prev_end), prev_touches)), Some((first, _))) = (prev, c.span) {
+                let gap = first.saturating_sub(prev_end);
+                if gap > 0 && (touches || prev_touches) {
+                    out = crate::spacing::merge_spacing(
+                        out,
+                        Some(crate::spacing::SegmentSpacing {
+                            min_gap: gap,
+                            max_gap: gap,
+                        }),
+                    );
+                }
+            }
+            if c.present {
+                if let Some(span) = c.span {
+                    prev = Some((span, touches));
+                }
+            }
+            if !touches {
                 continue;
             }
             let spacing = match c.spacing {

@@ -692,12 +692,24 @@ mod schema_rows_tests {
         )
         .unwrap();
         let later_spacing = segment_spacing(&later);
+        // The 13 s from the first segment's last row (22 s) to the second's
+        // first (35 s) is in neither footer, and counts for a range touching
+        // either segment.
+        let boundary = crate::spacing::SegmentSpacing {
+            min_gap: 13_000,
+            max_gap: 13_000,
+        };
+        assert_eq!(boundary, segment_spacing(&[22_000, 35_000]).unwrap());
+        let merge = crate::spacing::merge_spacing;
         assert_eq!(
             table.spacing_over(0, u64::MAX),
-            crate::spacing::merge_spacing(want, later_spacing)
+            merge(merge(want, later_spacing), Some(boundary))
         );
-        assert_eq!(table.spacing_over(0, 25_000), want);
-        assert_eq!(table.spacing_over(40_000, u64::MAX), later_spacing);
+        assert_eq!(table.spacing_over(0, 25_000), merge(want, Some(boundary)));
+        assert_eq!(
+            table.spacing_over(40_000, u64::MAX),
+            merge(later_spacing, Some(boundary))
+        );
         assert!(table.metadata_get(FOOTER_KEY).is_none());
     }
 
