@@ -18,9 +18,10 @@ use crate::{MetricsSource, QueryError, QueryOptions, QueryResult, RateMode};
 /// this recording's cadences, or `None` when it does not need any.
 ///
 /// Querying an [`ArchiveReader`] through [`MetricsSource`] applies the
-/// cross-cadence policy itself: when a query spans samplers recording at
-/// different rates, the points are moved onto the SLOW table's own rows, so
-/// every point lands where both operands genuinely have data. A caller that
+/// cross-cadence policy itself: where a query spans samplers recording at
+/// different rates, the points there are moved onto the SLOW table's own
+/// rows, so every point lands where both operands genuinely have data, and
+/// elsewhere they stay on the step's grid (see `cross_cadence`). A caller that
 /// instead composes `ArchiveReader::composition_sources` into
 /// a labelled multi-source queries that composed reader, never this one, and
 /// so silently loses the policy — the composed reader falls back to the
@@ -57,7 +58,7 @@ pub fn eval_timestamps_for(
 ) -> Option<Arc<[u64]>> {
     Plan::new(reader, query)
         .ok()?
-        .cross_cadence(step_s, rate_mode)
+        .cross_cadence(step_s, rate_mode, None)
 }
 
 /// What every query entry point works out once: the tables that can answer
@@ -151,9 +152,14 @@ impl<'a> Plan<'a> {
         out
     }
 
-    /// `opts` with the query's cross-cadence timestamps, when it has any.
-    fn opts(&self, opts: &QueryOptions, step_s: f64) -> QueryOptions {
-        match self.cross_cadence(step_s, opts.rate_mode) {
+    /// `opts` with the query's cross-cadence timestamps for a range from
+    /// `start_s` to `end_s`, when it has any.
+    fn opts(&self, opts: &QueryOptions, start_s: f64, end_s: f64, step_s: f64) -> QueryOptions {
+        let range = (
+            crate::promql::range_start_ns(start_s),
+            crate::promql::range_end_ns(end_s),
+        );
+        match self.cross_cadence(step_s, opts.rate_mode, Some(range)) {
             // Clone and set the one field: `QueryOptions` is
             // `#[non_exhaustive]`, so it cannot be built by literal from here
             // — and cloning preserves whatever else the caller set.
@@ -164,12 +170,17 @@ impl<'a> Plan<'a> {
 
     /// The cross-cadence timestamps of a query over one recording; `None`
     /// over several (see [`eval_timestamps_for`]).
-    fn cross_cadence(&self, step_s: f64, rate_mode: RateMode) -> Option<Arc<[u64]>> {
+    fn cross_cadence(
+        &self,
+        step_s: f64,
+        rate_mode: RateMode,
+        range: Option<(u64, u64)>,
+    ) -> Option<Arc<[u64]>> {
         let owners = &self.owners;
         if !owners.iter().all(|t| t.same_recording(owners[0])) {
             return None;
         }
-        cross_cadence(owners, step_s, rate_mode)
+        cross_cadence(owners, step_s, rate_mode, range)
     }
 }
 
@@ -195,8 +206,20 @@ impl<'a> Plan<'a> {
 /// lands where both operands genuinely have data, and each rate averages
 /// over the gap it actually spans.
 ///
-/// Returns `None` unless the query really touches more than one cadence, so
-/// single-sampler queries — the overwhelming majority — are untouched.
+/// That is decided per span, not per table: a table's spacing can change
+/// partway (100 ms rows, then 1 s rows), and the samplers' cadences are
+/// compared wherever their spacings are constant. Where the slowest sampler
+/// there is read at least twice as far apart as the fastest and coarser than
+/// the step, the points are its densest table's rows in that span; elsewhere
+/// they are the step's grid (`k·step`, the grid a query is evaluated on
+/// without explicit points). A table's spacing at each gap is that of the
+/// pair of rows either side ([`spacing`](crate::promql::streaming::spacing)),
+/// and a gap longer than twice that is a hole, where the table has no
+/// cadence.
+///
+/// Returns `None` unless the query really touches more than one cadence in
+/// some span, so single-sampler queries — the overwhelming majority — are
+/// untouched.
 ///
 /// Also `None` under [`RateMode::Raw`], which already answers this question
 /// its own way: Raw places points at the real, un-snapped sample
@@ -206,11 +229,14 @@ impl<'a> Plan<'a> {
 /// a counter-and-gauge expression would have its two sides land on
 /// different instants and intersect nowhere.
 ///
-/// `owners` are tables of one recording.
+/// `owners` are tables of one recording. With `range`, the grid points are
+/// those from a step before its start to its end; without, those across the
+/// tables' extent, so a fine step over a long recording is that many points.
 fn cross_cadence(
     owners: &[&SamplerReader],
     step_s: f64,
     rate_mode: RateMode,
+    range: Option<(u64, u64)>,
 ) -> Option<Arc<[u64]>> {
     if matches!(rate_mode, RateMode::Raw) {
         return None;
@@ -219,11 +245,10 @@ fn cross_cadence(
         return None;
     }
     // Cadence comes from the ROWS, not from `interval()`: that reports
-    // the recording's nominal interval, which every table in an archive
-    // shares — on a real recording a 1 s sampler and a 30 s one both
-    // answered 1.0, so asking it can never detect a cadence difference.
-    // These are the instants the query path reads, nothing having
-    // rounded them.
+    // one figure for a table, which on a real recording a 1 s sampler and
+    // a 30 s one both answered as 1.0, and which says nothing of a table
+    // whose spacing changes. These are the instants the query path reads,
+    // nothing having rounded them.
     //
     // Cadence is a property of the SAMPLER, not of a table. Two group
     // tables of one sampler are read together on one schedule; a group
@@ -232,44 +257,170 @@ fn cross_cadence(
     // silently change the answer for a query that merely named a
     // sibling group's metric.
     //
-    // So a sampler's cadence is the spacing of its DENSEST
-    // participating table — the one that shows the underlying read
+    // So a sampler's cadence at a time is the spacing of its DENSEST
+    // participating table there — the one that shows the underlying read
     // schedule.
-    let mut by_sampler: BTreeMap<&str, (u64, &[u64])> = BTreeMap::new();
+    // First from each table's finest and coarsest spacing, worked out once
+    // per table: no span can differ in cadence unless some sampler's coarsest
+    // is at least twice another's finest, and coarser than the step. Most
+    // queries stop here without walking any rows.
+    let mut extent: BTreeMap<&str, (f64, f64)> = BTreeMap::new();
     for t in owners {
-        let ts = t.row_timestamps();
-        let Some(gap) = typical_gap_ns(ts) else {
-            continue;
-        };
-        by_sampler
-            .entry(table_sampler(t.sampler()))
-            .and_modify(|slot| {
-                if gap < slot.0 {
-                    *slot = (gap, ts);
-                }
-            })
-            .or_insert((gap, ts));
+        if let Some((lo, hi)) = t.spacing_range() {
+            extent
+                .entry(table_sampler(t.sampler()))
+                .and_modify(|e| *e = (e.0.min(lo), e.1.max(hi)))
+                .or_insert((lo, hi));
+        }
     }
-    if by_sampler.len() < 2 {
+    let differ = extent.iter().any(|(a, (_, slow))| {
+        *slow > step_s
+            && extent
+                .iter()
+                .any(|(b, (fast, _))| a != b && *slow >= 2.0 * fast)
+    });
+    if !differ {
         return None;
     }
 
-    let fastest = by_sampler.values().map(|(gap, _)| *gap).min()?;
-    let (slowest, timestamps) = by_sampler.into_values().max_by_key(|(gap, _)| *gap)?;
-    // Deliberately a ratio, not equality: gaps measured from real rows
-    // are never exactly equal, so "different cadence" has to mean
-    // *materially* different. A sampler read at least twice as far
-    // apart as another is a different cadence in any sense that matters
-    // here.
-    if slowest < fastest.saturating_mul(2) {
+    let mut samplers: BTreeMap<&str, Vec<usize>> = BTreeMap::new();
+    let mut tables: Vec<(&[u64], Vec<Run>)> = Vec::new();
+    for t in owners {
+        let ts = t.row_timestamps();
+        let runs = cadence_runs(ts);
+        if runs.is_empty() {
+            continue;
+        }
+        samplers
+            .entry(table_sampler(t.sampler()))
+            .or_default()
+            .push(tables.len());
+        tables.push((ts, runs));
+    }
+    if samplers.len() < 2 {
         return None;
     }
-    // A slow sampler finer than the step is already oversampled by the
-    // grid; moving off it would only lose points.
-    if (slowest as f64) <= step_s * 1e9 {
+    let step_ns = (step_s * 1e9) as u64;
+
+    // Every time a table's cadence can change, and between each two, which
+    // table's rows the points are (`Some`) or the grid (`None`).
+    let mut cuts: Vec<u64> = tables
+        .iter()
+        .flat_map(|(_, runs)| runs.iter().flat_map(|r| [r.from, r.to]))
+        .collect();
+    cuts.sort_unstable();
+    cuts.dedup();
+    let mut cursor = vec![0usize; tables.len()];
+    let mut spans: Vec<(u64, u64, Option<usize>)> = Vec::new();
+    let mut any = false;
+    for w in cuts.windows(2) {
+        let (a, b) = (w[0], w[1]);
+        // Each sampler's cadence over [a, b): its densest table's there.
+        let mut cadence: Vec<(u64, usize)> = Vec::new();
+        for members in samplers.values() {
+            let mut densest: Option<(u64, usize)> = None;
+            for &i in members {
+                let runs = &tables[i].1;
+                while cursor[i] < runs.len() && runs[cursor[i]].to <= a {
+                    cursor[i] += 1;
+                }
+                let Some(r) = runs.get(cursor[i]).filter(|r| r.from <= a) else {
+                    continue;
+                };
+                let Some(gap) = r.spacing else { continue };
+                if densest.is_none_or(|(d, _)| gap < d) {
+                    densest = Some((gap, i));
+                }
+            }
+            cadence.extend(densest);
+        }
+        let fastest = cadence.iter().map(|(gap, _)| *gap).min();
+        let slowest = cadence.iter().max_by_key(|(gap, _)| *gap);
+        // Deliberately a ratio, not equality: gaps measured from real rows
+        // are never exactly equal, so "different cadence" has to mean
+        // *materially* different. A sampler read at least twice as far
+        // apart as another is a different cadence in any sense that matters
+        // here. A slow sampler finer than the step is already oversampled by
+        // the grid; moving off it would only lose points.
+        let at = match (fastest, slowest) {
+            (Some(fast), Some(&(slow, table)))
+                if cadence.len() >= 2 && slow >= fast.saturating_mul(2) && slow > step_ns =>
+            {
+                any = true;
+                Some(table)
+            }
+            _ => None,
+        };
+        match spans.last_mut() {
+            Some(last) if last.2 == at && last.1 == a => last.1 = b,
+            _ => spans.push((a, b, at)),
+        }
+    }
+    if !any {
         return None;
     }
-    Some(timestamps.into())
+
+    let (lo, hi) = range.map_or((0, u64::MAX), |(start, end)| {
+        (start.saturating_sub(step_ns), end)
+    });
+    let mut points: Vec<u64> = Vec::new();
+    for (a, b, at) in spans {
+        match at {
+            Some(table) => {
+                let ts = tables[table].0;
+                let from = ts.partition_point(|&t| t < a);
+                let to = ts.partition_point(|&t| t < b);
+                points.extend_from_slice(&ts[from..to]);
+            }
+            None if step_ns > 0 => {
+                let (a, b) = (a.max(lo), b.min(hi.saturating_add(1)));
+                let mut t = a.div_ceil(step_ns).saturating_mul(step_ns);
+                while t < b {
+                    points.push(t);
+                    t = t.saturating_add(step_ns);
+                }
+            }
+            None => {}
+        }
+    }
+    points.dedup();
+    Some(points.into())
+}
+
+/// A stretch of a table's rows read at one spacing: from one row's stamp to
+/// the next one's, or past the last row for the last.
+#[derive(Debug, PartialEq)]
+struct Run {
+    from: u64,
+    to: u64,
+    /// The spacing there, `None` across a hole.
+    spacing: Option<u64>,
+}
+
+/// The cadence of `ts` (one table's row stamps, in time order) between each
+/// two rows: the spacing of the pair, or, for a pair alone, its gap; `None`
+/// where the pair is further apart than twice that, a hole
+/// (`metriken_storage::spacing::pair_spacings`). Consecutive gaps of one
+/// spacing are one run, and the last row is inside the last run.
+fn cadence_runs(ts: &[u64]) -> Vec<Run> {
+    let mut runs: Vec<Run> = Vec::new();
+    for (k, spacing) in metriken_storage::spacing::pair_spacings(ts) {
+        if ts[k] == ts[k - 1] {
+            continue;
+        }
+        match runs.last_mut() {
+            Some(last) if last.spacing == spacing && last.to == ts[k - 1] => last.to = ts[k],
+            _ => runs.push(Run {
+                from: ts[k - 1],
+                to: ts[k],
+                spacing,
+            }),
+        }
+    }
+    if let Some(last) = runs.last_mut() {
+        last.to = last.to.saturating_add(1);
+    }
+    runs
 }
 
 /// The engine a query is evaluated with: over the one recording it reaches,
@@ -547,26 +698,6 @@ fn recording_source(
         })
 }
 
-/// The typical spacing between consecutive rows, or `None` for fewer than two
-/// rows (no gap to measure).
-///
-/// The median, not the mean: a sampler's rows are irregular — 30 s then 60 s
-/// apart on a real recording — and a mean is dragged around by the long gaps
-/// and by any restart-sized hole in the middle of a recording. The median
-/// answers "how often does this table usually produce a row", which is the
-/// question being asked.
-fn typical_gap_ns(timestamps: &[u64]) -> Option<u64> {
-    if timestamps.len() < 2 {
-        return None;
-    }
-    let mut gaps: Vec<u64> = timestamps
-        .windows(2)
-        .map(|w| w[1].saturating_sub(w[0]))
-        .collect();
-    gaps.sort_unstable();
-    Some(gaps[gaps.len() / 2]).filter(|g| *g > 0)
-}
-
 impl MetricsSource for ArchiveReader {
     // ── Query methods: one engine over the recordings the query reaches. ──
     fn query_range_opts(
@@ -581,7 +712,13 @@ impl MetricsSource for ArchiveReader {
         let Some(engine) = engine(&plan, expr)? else {
             return Ok(QueryResult::Matrix { result: Vec::new() });
         };
-        checked(engine.query_range_opts(expr, start_s, end_s, step_s, &plan.opts(opts, step_s))?)
+        checked(engine.query_range_opts(
+            expr,
+            start_s,
+            end_s,
+            step_s,
+            &plan.opts(opts, start_s, end_s, step_s),
+        )?)
     }
     /// Routed as [`query_range_opts`](Self::query_range_opts) is, with the
     /// same evaluation timestamps.
@@ -607,7 +744,7 @@ impl MetricsSource for ArchiveReader {
             end_s,
             step_s,
             opts,
-            &plan.opts(qopts, step_s),
+            &plan.opts(qopts, start_s, end_s, step_s),
         )?)
     }
     fn query(&self, expr: &str, time: Option<f64>) -> Result<QueryResult, QueryError> {
@@ -692,24 +829,40 @@ impl MetricsSource for ArchiveReader {
 mod tests {
     use super::*;
 
-    /// The typical gap is the MEDIAN, so one long hole (a restart, a missed
-    /// poll) does not masquerade as the table's cadence. Moved from rezolus.
+    /// A table's cadence is the spacing around each gap, so one long hole
+    /// (a restart, a missed poll) is a hole, not the table's cadence, and a
+    /// change of spacing is two runs.
     #[test]
-    fn typical_gap_is_robust_to_a_single_long_hole() {
+    fn cadence_runs_are_robust_to_a_single_long_hole() {
         const S: u64 = 1_000_000_000;
         let steady: Vec<u64> = (0..10).map(|i| i * S).collect();
-        assert_eq!(typical_gap_ns(&steady), Some(S));
+        assert_eq!(
+            cadence_runs(&steady),
+            vec![Run {
+                from: 0,
+                to: 9 * S + 1,
+                spacing: Some(S)
+            }]
+        );
 
         let mut holed = steady.clone();
         holed.extend((0..10).map(|i| 110 * S + i * S));
-        assert_eq!(
-            typical_gap_ns(&holed),
-            Some(S),
-            "a mean would be dragged upward by the hole; the median must not be"
-        );
+        let runs = cadence_runs(&holed);
+        let spacings: Vec<Option<u64>> = runs.iter().map(|r| r.spacing).collect();
+        assert_eq!(spacings, vec![Some(S), None, Some(S)], "{runs:?}");
+        assert_eq!((runs[1].from, runs[1].to), (9 * S, 110 * S));
 
-        assert_eq!(typical_gap_ns(&[]), None);
-        assert_eq!(typical_gap_ns(&[42]), None);
+        // 1 s rows, then 100 ms rows: two cadences, the change inside a few
+        // rows of where it happened.
+        let mut slowed: Vec<u64> = (0..20).map(|i| i * S).collect();
+        slowed.extend((1..=100).map(|i| 19 * S + i * S / 10));
+        let runs = cadence_runs(&slowed);
+        assert_eq!(runs.first().unwrap().spacing, Some(S));
+        assert_eq!(runs.last().unwrap().spacing, Some(S / 10));
+        assert!(runs.iter().all(|r| r.spacing.is_some()), "{runs:?}");
+
+        assert!(cadence_runs(&[]).is_empty());
+        assert!(cadence_runs(&[42]).is_empty());
     }
 
     // ── Recording labels on series ──

@@ -9,6 +9,7 @@
 
 use std::collections::VecDeque;
 
+use super::spacing::{self, HoleMemo, Stamped, SIDE_GAPS};
 use super::{Point, RateEdges};
 use crate::types::CounterSample;
 
@@ -35,21 +36,40 @@ fn stream_of(
 /// A sample as the pair-wise producer keeps it: stamp, value, window.
 type Sample = (u64, u64, Option<(u64, u64)>);
 
+/// A sample the pair-wise producer holds.
+struct Held(Sample, HoleMemo);
+
+impl Stamped for Held {
+    fn ts(&self) -> u64 {
+        self.0 .0
+    }
+    fn hole(&self) -> &HoleMemo {
+        &self.1
+    }
+}
+
 /// Pair-wise rate producer over a counter sample stream, for `irate` in raw
 /// mode: one point per sample up to `end_ns`, from the first read, the rate
 /// from the sample before it. The first sample read, and a sample further
-/// than [`max_gap`](Self::max_gap) from the one before it, is a timing
+/// from the one before it than four of the pair's spacing
+/// ([`super::spacing`]) or than [`max_gap`](Self::max_gap), is a timing
 /// point: a join holds the next point for the gap from it
 /// ([`super::Held`]), and the result is cut at the range's start.
 ///
-/// Pulls one sample at a time and remembers the previous: a producer is the
-/// series' iterator for the rest of the pipeline, and it holds only what the
-/// next point needs.
+/// Pulls one sample at a time and holds the [`SIDE_GAPS`] samples either
+/// side of the pair it is at, whose gaps that pair's spacing is taken over:
+/// a producer is the series' iterator for the rest of the pipeline, and it
+/// holds only what the next point needs.
 pub struct CounterPairwiseRate<'a> {
     source: Samples<'a>,
-    prev: Option<Sample>,
+    exhausted: bool,
+    /// The samples held, oldest first: `held[next]` is the next one a point
+    /// is emitted at.
+    held: VecDeque<Held>,
+    next: usize,
     end_ns: u64,
-    /// The longest gap a pair spans and gives a value.
+    /// The longest gap a pair spans and gives a value: the read reaches
+    /// that far back.
     max_gap_ns: u64,
 }
 
@@ -62,16 +82,18 @@ impl<'a> CounterPairwiseRate<'a> {
     pub fn from_stream(source: Samples<'a>, end_ns: u64) -> Self {
         Self {
             source,
-            prev: None,
+            exhausted: false,
+            held: VecDeque::new(),
+            next: 0,
             end_ns,
             max_gap_ns: u64::MAX,
         }
     }
 
-    /// Give no value for a pair further apart than `gap_ns`: the read
-    /// reaches that far back, and the sample before a longer pair may be
-    /// before the read's start, so its value would depend on where the read
-    /// starts.
+    /// Give no value for a pair further apart than `gap_ns`, whatever its
+    /// spacing: the read reaches that far back, and the sample before a
+    /// longer pair may be before the read's start, so its value would
+    /// depend on where the read starts.
     pub(crate) fn max_gap(mut self, gap_ns: u64) -> Self {
         self.max_gap_ns = gap_ns;
         self
@@ -83,19 +105,38 @@ impl<'a> Iterator for CounterPairwiseRate<'a> {
 
     fn next(&mut self) -> Option<Point> {
         loop {
-            let cur = self.source.next()?;
-            let cur = (cur.ts, cur.value, cur.window);
+            // The samples after this one whose gaps its pair's spacing is
+            // taken over.
+            while !self.exhausted && self.held.len() <= self.next + SIDE_GAPS {
+                match self.source.next() {
+                    Some(s) => self
+                        .held
+                        .push_back(Held((s.ts, s.value, s.window), HoleMemo::default())),
+                    None => self.exhausted = true,
+                }
+            }
+            let i = self.next;
+            let cur = self.held.get(i)?.0;
             if cur.0 > self.end_ns {
                 return None;
             }
-            let Some(prev) = self.prev.replace(cur) else {
+            self.next += 1;
+            // This pair's spacing reads the gaps ending at the sample before
+            // `i` and the `SIDE_GAPS - 1` before that; later pairs read later
+            // ones.
+            while self.next > SIDE_GAPS + 2 {
+                self.held.pop_front();
+                self.next -= 1;
+            }
+            let i = self.next - 1;
+            let Some(prev) = i.checked_sub(1).map(|p| self.held[p].0) else {
                 return Some(Point::timing_at(cur.0));
             };
             // A second sample at one time adds no point.
             if cur.0 == prev.0 {
                 continue;
             }
-            if cur.0 - prev.0 > self.max_gap_ns {
+            if !spacing::within(&self.held, i, cur.0 - prev.0, 4, self.max_gap_ns) {
                 return Some(Point::timing_at(cur.0));
             }
             if let Some(point) = pair_rate((prev, cur)) {
@@ -141,32 +182,45 @@ fn pair_rate(
 }
 
 /// Where a `rate`'s window `[from, at]` over `kept` (in time order) starts:
-/// at `from` when a sample at or before it is no more than `reach_ns` before
+/// at `from` when a sample at or before it is no more than its reach before
 /// it, so that the value at `from` interpolates from that sample; otherwise
 /// at the first sample after `from`, or `None` when there is none before
-/// `at`. The reach is fixed before the read and the read covers it, so the
-/// window does not depend on where the read starts.
-pub(crate) fn range_start<T>(
-    kept: &VecDeque<T>,
-    ts: impl Fn(&T) -> u64,
+/// `at`. The reach is two of the spacing of the pair of samples around
+/// `from` ([`spacing`]), and at most `reach_ns`: the read starts that far
+/// before the first window and no further (`rate_lookback`), so the window
+/// does not depend on where the read starts. A pair with no gap either side
+/// takes `reach_ns`.
+pub(crate) fn range_start<K: Stamped>(
+    kept: &VecDeque<K>,
     from: u64,
     at: u64,
     reach_ns: u64,
 ) -> Option<u64> {
-    let i = kept.partition_point(|k| ts(k) <= from);
-    if i > 0 && from - ts(&kept[i - 1]) <= reach_ns {
+    let i = kept.partition_point(|k| k.ts() <= from);
+    if i > 0 && spacing::within(kept, i, from - kept[i - 1].ts(), 2, reach_ns) {
         return Some(from);
     }
-    kept.get(i).map(ts).filter(|s| *s < at)
+    kept.get(i).map(Stamped::ts).filter(|s| *s < at)
 }
 
 /// One sample as the grid producer keeps it: its stamp, the reset-adjusted
-/// cumulative value at it, and its acquisition window.
-#[derive(Copy, Clone, Debug)]
+/// cumulative value at it, its acquisition window, and whether the gap
+/// ending at it is a hole once worked out.
+#[derive(Clone, Debug)]
 struct Kept {
     ts: u64,
     cum: f64,
     window: Option<(u64, u64)>,
+    hole: HoleMemo,
+}
+
+impl Stamped for Kept {
+    fn ts(&self) -> u64 {
+        self.ts
+    }
+    fn hole(&self) -> &HoleMemo {
+        &self.hole
+    }
 }
 
 /// Interpolating rate producer.
@@ -188,8 +242,9 @@ struct Kept {
 /// any point only the samples bracketing the current interval are needed:
 /// those are kept, the ones before the interval's left edge are let go, and
 /// the ones after its right edge have not been pulled yet. A series is held
-/// one interval's worth at a time rather than whole — see
-/// [`CounterPairwiseRate`] for what that used to cost.
+/// one interval's worth at a time rather than whole, with the
+/// [`SIDE_GAPS`] samples either side whose gaps the spacing of a pair is
+/// taken over ([`spacing`]).
 pub struct CounterGridRate<'a> {
     source: Samples<'a>,
     exhausted: bool,
@@ -204,12 +259,6 @@ pub struct CounterGridRate<'a> {
     /// The previous raw value and the running reset-adjusted cumulative.
     prev_value: Option<u64>,
     acc: f64,
-    /// The gaps between the first samples, for the typical spacing that
-    /// tells a hole from jitter — see [`Self::sampled_window`].
-    spacings: Vec<u64>,
-    /// Their median, fixed once the probe is full. Computed per point before,
-    /// which was a clone and a sort per emitted point.
-    typical: u64,
     /// Whether the samples carry acquisition windows.
     windowed: bool,
     cursor_ns: u64,
@@ -218,7 +267,8 @@ pub struct CounterGridRate<'a> {
     /// The window of each point on the grid, and with `range` everywhere.
     span_ns: u64,
     /// `rate(x[r])`: the window is `span_ns` at every placement, and
-    /// starts as [`range_start`] says with `reach_ns`.
+    /// starts as [`range_start`] says, with `reach_ns` for a pair that has
+    /// no spacing.
     range: bool,
     reach_ns: u64,
     /// Emit at each sample time rather than on the grid or at `points`: the
@@ -238,9 +288,6 @@ pub struct CounterGridRate<'a> {
     points: Option<(std::sync::Arc<[u64]>, usize)>,
     done: bool,
 }
-
-/// How many leading samples the typical spacing is taken from.
-pub(crate) const SPACING_PROBE: usize = 9;
 
 impl<'a> CounterGridRate<'a> {
     /// From whole vectors; see [`from_stream`](Self::from_stream).
@@ -286,8 +333,6 @@ impl<'a> CounterGridRate<'a> {
             pulled: 0,
             prev_value: None,
             acc: 0.0,
-            spacings: Vec::new(),
-            typical: 1,
             windowed,
             cursor_ns: start_ns,
             end_ns,
@@ -300,20 +345,11 @@ impl<'a> CounterGridRate<'a> {
             points: None,
             done: step_ns == 0,
         };
-        // The typical spacing is taken from the first samples, so they are
-        // pulled up front; that is also where a series too short to bracket
-        // any interval is found out.
-        while this.pulled < SPACING_PROBE && this.pull() {}
+        // A series too short to bracket any interval is found out here.
+        while this.pulled < 2 && this.pull() {}
         if this.pulled < 2 {
             this.done = true;
         }
-        let mut spacings = this.spacings.clone();
-        spacings.sort_unstable();
-        this.typical = spacings
-            .get(spacings.len() / 2)
-            .copied()
-            .unwrap_or(1)
-            .max(1);
         this
     }
 
@@ -337,11 +373,6 @@ impl<'a> CounterGridRate<'a> {
             };
         }
         self.prev_value = Some(sample.value);
-        if let Some(last) = self.last_ts {
-            if self.spacings.len() < SPACING_PROBE - 1 {
-                self.spacings.push(sample.ts - last);
-            }
-        }
         self.first_ts.get_or_insert(sample.ts);
         self.last_ts = Some(sample.ts);
         self.pulled += 1;
@@ -349,22 +380,24 @@ impl<'a> CounterGridRate<'a> {
             ts: sample.ts,
             cum: self.acc,
             window: sample.window,
+            hole: HoleMemo::default(),
         });
         true
     }
 
-    /// Pull until a sample at or past `edge` is kept, or the stream ends.
+    /// Pull until [`SIDE_GAPS`] samples past the first at or past `edge`
+    /// are kept, or the stream ends: the gaps the spacing of the pairs
+    /// around `edge` is taken over.
     fn reach(&mut self, edge: u64) {
-        while self.kept.back().is_none_or(|k| k.ts < edge) && self.pull() {}
+        while !spacing::sees_past(&self.kept, edge) && self.pull() {}
     }
 
     /// Let go of the samples before `left` that no interval will need
     /// again: everything but the last sample at or before it, which the
-    /// interpolation at `left` brackets against.
+    /// interpolation at `left` brackets against, and the samples before it
+    /// that its pair's spacing reads.
     fn trim(&mut self, left: u64) {
-        while self.kept.len() >= 2 && self.kept[1].ts <= left {
-            self.kept.pop_front();
-        }
+        spacing::trim(&mut self.kept, left);
     }
 
     /// Position in `kept` of the first sample at or after `edge`, or
@@ -384,12 +417,11 @@ impl<'a> CounterGridRate<'a> {
     /// Linearly interpolate the reset-adjusted cumulative value at `edge`.
     /// Returns `None` when `edge` is outside the observed sample range (no
     /// extrapolation). The caller has pulled through `edge` and not trimmed
-    /// past it.
-    fn interp(&self, edge: u64) -> Option<f64> {
+    /// past it, and `hi` is [`hi(edge)`](Self::hi).
+    fn interp(&self, edge: u64, hi: usize) -> Option<f64> {
         if !self.observed(edge) {
             return None;
         }
-        let hi = self.hi(edge);
         let k_hi = self.kept.get(hi)?;
         if k_hi.ts == edge {
             return Some(k_hi.cum);
@@ -414,39 +446,38 @@ impl<'a> CounterGridRate<'a> {
     /// interpolating one fabricates a read. Returns `None` there, which is what
     /// suppresses the band and raises `Point::interpolated`.
     ///
-    /// The threshold is the median sample spacing, doubled: adjacent reads pass
-    /// even when the cadence jitters, while a hole spanning several missing
-    /// samples does not.
-    fn sampled_window(&self, edge: u64) -> Option<(f64, f64)> {
+    /// The threshold is twice the spacing of the pair around `edge`
+    /// ([`spacing`]): adjacent reads pass even when the cadence jitters,
+    /// while a hole spanning several missing samples does not, and a series
+    /// whose spacing changes is measured against the spacing where the edge
+    /// is. A pair with no gap either side is not a hole. `hi` is
+    /// [`hi(edge)`](Self::hi).
+    fn sampled_window(&self, edge: u64, hi: usize) -> Option<(f64, f64)> {
         if self.pulled < 2 {
-            return self.interp_window(edge);
+            return self.interp_window(edge, hi);
         }
-        let hi = self.hi(edge);
         // Exactly on a read: that read's own window, no question of holes.
         if self.kept.get(hi).is_some_and(|k| k.ts == edge) {
-            return self.interp_window(edge);
+            return self.interp_window(edge, hi);
         }
         if hi == 0 || hi >= self.kept.len() {
             return None;
         }
-        let gap = self.kept[hi].ts - self.kept[hi - 1].ts;
-        // Typical spacing, from the first few gaps — enough to characterize a
-        // regular cadence without walking the whole series.
-        if gap > self.typical.saturating_mul(2) {
+        if spacing::is_hole(&self.kept, hi) {
             return None;
         }
-        self.interp_window(edge)
+        self.interp_window(edge, hi)
     }
 
     /// Interpolate the acquisition-window `(begin, end)` at `edge`, in the
     /// same way as [`Self::interp`] does the value, so the uncertainty band
     /// is attributable to the grid edge rather than the nearest raw sample.
     /// `None` when there are no windows or `edge` is outside the sample range.
-    fn interp_window(&self, edge: u64) -> Option<(f64, f64)> {
+    /// `hi` is [`hi(edge)`](Self::hi).
+    fn interp_window(&self, edge: u64, hi: usize) -> Option<(f64, f64)> {
         if !self.windowed || !self.observed(edge) {
             return None;
         }
-        let hi = self.hi(edge);
         let k_hi = self.kept.get(hi)?;
         let (b_hi, e_hi) = k_hi.window?;
         if k_hi.ts == edge {
@@ -581,8 +612,8 @@ impl<'a> Iterator for CounterGridRate<'a> {
             // and no further back than the read before its left edge.
             self.reach(t);
             // At the end of the range, the series' latest rate is held: when
-            // its last sample is within its typical spacing of the range's
-            // end, a point past that sample is the rate over the same span
+            // its last sample is within its spacing there (the median of the
+            // last gaps) of the range's end, a point past that sample is the rate over the same span
             // ending at it, as a gauge is held past its last sample. Without
             // it, a series whose rows fall between the grid's points has none
             // at the range's end, and `sum` across series out of phase with
@@ -594,7 +625,12 @@ impl<'a> Iterator for CounterGridRate<'a> {
             let (at, from) = match self.last_ts.filter(|last| self.exhausted && t > *last) {
                 None => (t, left),
                 Some(last)
-                    if self.pulled >= 2 && self.end_ns.saturating_sub(last) <= self.typical =>
+                    if self.pulled >= 2
+                        && spacing::at_least(
+                            &self.kept,
+                            self.kept.len(),
+                            self.end_ns.saturating_sub(last),
+                        ) == Some(true) =>
                 {
                     (last, last.saturating_sub(t - left))
                 }
@@ -607,7 +643,7 @@ impl<'a> Iterator for CounterGridRate<'a> {
             // holds the next point for the gap from it (`super::Held`).
             let none = |samples: bool| samples.then(|| Point::timing_at(t));
             let from = if self.range {
-                match range_start(&self.kept, |k| k.ts, from, at, self.reach_ns) {
+                match range_start(&self.kept, from, at, self.reach_ns) {
                     Some(from) => from,
                     None => match none(self.samples.is_some()) {
                         Some(p) => return Some(p),
@@ -620,7 +656,10 @@ impl<'a> Iterator for CounterGridRate<'a> {
             self.trim(from);
             let (t_eval, left) = (at, from);
             let step_s = (t_eval as f64 - left as f64) / 1e9;
-            let (Some(v_hi), Some(v_lo)) = (self.interp(t_eval), self.interp(left)) else {
+            let (hi_eval, hi_left) = (self.hi(t_eval), self.hi(left));
+            let (Some(v_hi), Some(v_lo)) =
+                (self.interp(t_eval, hi_eval), self.interp(left, hi_left))
+            else {
                 match none(self.samples.is_some()) {
                     Some(p) => return Some(p),
                     None => continue,
@@ -648,7 +687,9 @@ impl<'a> Iterator for CounterGridRate<'a> {
             // the producer did not read, and the band then claims a precision
             // nobody measured. Where that would happen, the point is emitted
             // with a value and no band, flagged `interpolated`; see `Point`.
-            let window_pair = self.sampled_window(left).zip(self.sampled_window(t_eval));
+            let window_pair = self
+                .sampled_window(left, hi_left)
+                .zip(self.sampled_window(t_eval, hi_eval));
             let interpolated = window_pair.is_none() && self.windowed;
             let bounds = window_pair
                 .and_then(|((b_left, e_left), (b_hi, e_hi))| {

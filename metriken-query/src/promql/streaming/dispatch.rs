@@ -200,11 +200,12 @@ fn raw_read_back(ctx: &Ctx<'_>, window_ns: u64) -> u64 {
 }
 
 /// How far before a `rate(name[range])` window's left edge a sample is
-/// interpolated from, for a series that does not carry its table's
+/// interpolated from at most, for a series that does not carry its table's
 /// interval: two of `counter_interval`, which no series of the source
-/// exceeds (`DataSource::counter_interval`). A window with no sample that
-/// close before its left edge starts at the first sample after it
-/// (`range_start`).
+/// exceeds (`DataSource::counter_interval`). Within it the reach is two of
+/// the spacing of the samples around the edge (`range_start`), and a window
+/// with no sample that close before its left edge starts at the first
+/// sample after it.
 fn rate_reach(ctx: &Ctx<'_>, name: &str) -> u64 {
     crate::batch_rate::interval_reach(ctx.source.counter_interval(name))
 }
@@ -212,7 +213,7 @@ fn rate_reach(ctx: &Ctx<'_>, name: &str) -> u64 {
 /// How far before a `rate(name[range])` point's time its read starts: the
 /// `[range]`, the reach before it ([`rate_reach`]), and one reach more for
 /// a point held past a series' last sample, whose window ends at that
-/// sample, up to the series' typical spacing before the point.
+/// sample, up to the series' spacing there before the point.
 fn rate_lookback(ctx: &Ctx<'_>, name: &str, range_ns: u64) -> u64 {
     range_ns.saturating_add(rate_reach(ctx, name).saturating_mul(2))
 }
@@ -844,7 +845,8 @@ where
             // on the grid needs at least one step of lookback to bracket the
             // first interval's left edge. Raw reads as `raw_read_back` says:
             // a raw `rate` over its window, a raw `irate` over the pair, no
-            // further apart than four of its interval (`max_gap`).
+            // further apart than four of its interval (`max_gap`), and four
+            // of its spacing within that.
             let lookback = match (ctx.rate_mode, range) {
                 (RateMode::Grid, true) => rate_lookback(ctx, metric_name, range_ns),
                 (RateMode::Grid, false) => range_ns.max(ctx.step_ns),
@@ -923,8 +925,9 @@ where
                     ),
                     RateMode::Raw => LabeledSeries::new(
                         stream.labels,
-                        // A pair spans up to four of the series' interval
-                        // (two reaches): a missed tick or two with jitter.
+                        // A pair spans up to four of its spacing, and of the
+                        // series' interval (two reaches): a missed tick or
+                        // two with jitter.
                         CounterPairwiseRate::from_stream(stream.samples, ctx.end_ns)
                             .max_gap(reach.saturating_mul(2)),
                     ),
@@ -1146,11 +1149,14 @@ where
         .ok_or_else(|| QueryError::ParseError("Vector selector missing name".to_string()))?;
     let filter = extract_filter_labels(&sel.matchers.matchers);
 
-    // A gauge is held a step, or its sampling interval when that is longer,
-    // past each sample. The interval is the series' own: a source joining
-    // recordings of different intervals hands each recording's series over
-    // with its interval (`gauge_parts`), so a 10 s recording's gauge is not
-    // dropped between its rows beside a 1 s recording's.
+    // A gauge is held a step, or the spacing of the samples around the
+    // point when that is longer, past each sample, and at most its sampling
+    // interval when that is longer than the step (`GaugeStepGrid`): the read
+    // starts that far before the range. The interval is the series' own: a
+    // source joining recordings of different intervals hands each
+    // recording's series over with its interval (`gauge_parts`), so a 10 s
+    // recording's gauge is not dropped between its rows beside a 1 s
+    // recording's.
     // In raw mode the read starts as `raw_read_back` says.
     let read_start = match ctx.rate_mode {
         RateMode::Grid => ctx.start_ns,

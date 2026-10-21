@@ -42,6 +42,7 @@ pub(crate) mod dispatch;
 mod gauge;
 pub(crate) mod histogram;
 mod rate;
+pub(crate) mod spacing;
 
 #[cfg(test)]
 mod tests;
@@ -52,7 +53,7 @@ pub(crate) use binary::{
     interval_binop, matrix_matrix_op, matrix_scalar_op, scalar_point, BinOp, MatchSpec,
 };
 pub(crate) use gauge::{AtPoints, GaugeAvgOverTime, GaugeDeriv, GaugeIdelta, GaugeStepGrid};
-pub(crate) use rate::{range_start, CounterGridRate, CounterPairwiseRate, SPACING_PROBE};
+pub(crate) use rate::{range_start, CounterGridRate, CounterPairwiseRate};
 
 #[cfg(test)]
 pub(crate) use aggregate::sum_by;

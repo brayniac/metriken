@@ -5,6 +5,48 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- A rate's band and its interpolated flag treat a gap as a hole when it is
+  longer than twice the spacing of the samples around it: the larger of the
+  median of up to eight gaps before the pair and the median of up to eight
+  after it. It was twice the median of the first nine samples read. A series
+  whose first samples were 100 ms apart and later ones 1 s had no band on any
+  point of the 1 s span (600 of 600 `irate` points at a 100 ms step in the
+  regression fixture), a 1 s gap inside a 100 ms span of a series that began
+  at 1 s kept its band, and the bands depended on where the range started.
+- A `rate`'s reach (how far before a window's left edge a sample is
+  interpolated from), a gauge's hold past its latest sample and the longest
+  pair raw `irate` gives a value for are two, one and four of the spacing of
+  the samples around the point, and at most what they were: two intervals,
+  the step or the interval, and four intervals. Inside a 100 ms span of a
+  table whose interval is 1 s, a gauge is no longer held a second past a
+  missing row, raw `irate` gives no value across a 1 s gap, and a `rate`
+  window starting in such a gap starts at the row after it. Where a series'
+  rows are further apart than its interval (a table probed at 100 ms that
+  later reads every 1 s) the three are the interval's, as before: a read
+  starts that far before the range, and a longer bound would make a result
+  depend on where the range starts.
+- Over an `ArchiveReader`, a query across samplers of different cadence is
+  evaluated at the slow sampler's rows only in the spans where the cadences
+  differ, and on the step's grid elsewhere, and `eval_timestamps_for`
+  returns those points. It compared one median gap per table: a table read
+  every 1 s with a 100 ms stretch, beside a 1 s table, was evaluated at the
+  1 s rows everywhere, and a table going from 100 ms to 1 s rows beside a
+  100 ms table was evaluated on the grid throughout. Without a range,
+  `eval_timestamps_for` fills the grid spans across the tables' extent, so a
+  fine step over a long recording is that many points.
+- Documented in the crate docs: `avg_over_time` is a mean over samples, as
+  in Prometheus, and an unstrided histogram function gives one point per row
+  and ignores the step; over a source whose spacing changes, a chart uses
+  the strided form with the stride at its step.
+- Measured on a 9.6 h archive (1 s rows, full range, step 1 s): the batched
+  `rate(x[1m])` path is 16% slower, batched `irate` 7%, raw `irate` 16%;
+  per-series `irate` takes the same time and per-series `rate` 12% less.
+- Needs metriken-storage 0.4.1 (`spacing`).
+
 ## [0.41.0] - 2026-10-19
 
 ### Changed

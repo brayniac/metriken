@@ -23,6 +23,31 @@
 //! queries; attach it to any source with `.with_pool(...)`. The pool
 //! is process-wide and LRU-evicted by byte budget.
 //!
+//! # Series whose row spacing changes
+//!
+//! A table can change cadence partway (rows every 1 s, then every 100 ms).
+//! `rate`, `irate` and bare gauge selectors take their bounds from the
+//! spacing of the rows near each point ([`RateMode`]), and a query spanning
+//! tables of different cadence is evaluated at the slow table's rows only
+//! where the cadences differ (`eval_timestamps_for`). Two kinds of function
+//! do not give one point per step, and say so here:
+//!
+//! * `avg_over_time(g[r])` is the mean of the samples in the window, each
+//!   counted once, as in Prometheus: it is not weighted by how long each
+//!   value held, so a window holding 100 ms rows and 1 s rows weighs each
+//!   fine row as much as each coarse one.
+//! * An unstrided histogram function (`histogram_quantile(q, h)`,
+//!   `histogram_quantiles([..], h)`, `histogram_count(h)`, `histogram_sum`,
+//!   `histogram_mean`, `histogram_irate`) emits one point per row and
+//!   ignores the step. Each point is the delta from the
+//!   row before, so a count or a sum per point scales with the row spacing:
+//!   `histogram_count(h)` of a series observing 110 a second reads 110 per
+//!   point over 1 s rows and 11 per point over 100 ms rows. The strided
+//!   forms (`histogram_count(h, s)`, `histogram_quantiles([..], h, s)`, the
+//!   trailing argument a stride in seconds) give one point per stride from
+//!   the rows in each window, and are the forms a chart should use over a
+//!   source whose spacing changes, with the stride at the chart's step.
+//!
 //! # Example
 //!
 //! ```no_run
@@ -38,6 +63,8 @@
 #[cfg(feature = "archive")]
 mod archive;
 pub(crate) mod batch_rate;
+#[cfg(all(test, feature = "archive"))]
+mod cadence_tests;
 #[cfg(all(test, feature = "archive"))]
 mod conformance;
 pub mod display;
@@ -74,15 +101,22 @@ pub use union::UnionMetricsSource;
 /// `rate(x[r])` at `t` is the increase of the reset-adjusted cumulative
 /// counter across `[t − r, t]`, interpolated at both ends, divided by the
 /// window's length. The value at `t − r` is interpolated from a sample up
-/// to two of the series' interval before it: its table's, where the source
-/// sets it on the series (`LabeledSource::with_interval`, as an archive
-/// does for each table), else the source's `DataSource::counter_interval`.
-/// Where the series has no sample that close before `t − r` (it starts
-/// later, or has a gap there), the window starts at the first sample after
-/// `t − r` and is shorter than `r`, and with no sample in `(t − r, t)` such
-/// a window gives no point. `irate(x[r])` ignores `r`: on the grid its
-/// window is one step, and in raw mode it is the gap to the previous
-/// sample.
+/// to two of the spacing of the samples around `t − r` before it, and at
+/// most two of the series' interval: its table's, where the source sets it
+/// on the series (`LabeledSource::with_interval`, as an archive does for
+/// each table), else the source's `DataSource::counter_interval`. The spacing of two consecutive
+/// samples is the larger of the median of up to eight gaps before them and
+/// the median of up to eight after (`metriken_storage::spacing`), so a
+/// series whose spacing changes (1 s rows, then 100 ms rows) is read at the
+/// spacing where each point is. Where the series has no sample that close
+/// before `t − r` (it starts later, or has a gap there), the window starts
+/// at the first sample after `t − r` and is shorter than `r`, and with no
+/// sample in `(t − r, t)` such a window gives no point. `irate(x[r])`
+/// ignores `r`: on the grid its window is one step, and in raw mode it is
+/// the gap to the previous sample. A gauge is held past its latest sample
+/// for the step, or the spacing of the samples around the point when that
+/// is longer, and at most for its interval when that is longer than the
+/// step.
 ///
 /// * [`Grid`](RateMode::Grid) (default): points at each grid tick
 ///   `t = floor(start/step)·step + k·step`. The grid phase is fixed to the
@@ -91,7 +125,8 @@ pub use union::UnionMetricsSource;
 ///   interval `[t − step, t]`.
 /// * [`Raw`](RateMode::Raw): points at the series' sample timestamps. `irate`
 ///   is the rate between each sample and the one before it, with no value
-///   when they are further apart than four of the counter's interval. The
+///   when they are further apart than four of the pair's spacing or four of
+///   the counter's interval, whichever is shorter. The
 ///   points of two series are not aligned with one another; for
 ///   jitter/cadence and single-recording analysis. An aggregation or a
 ///   binary operator over raw series has a point at every time one of them
@@ -104,9 +139,10 @@ pub use union::UnionMetricsSource;
 ///   for each join the query nests, and the function's window, before the
 ///   range, so which points a result has and their values do not depend on
 ///   where the range starts, up to floating-point rounding. A rate's band
-///   and its interpolated flag treat a gap longer than twice the median
-///   spacing of the first nine samples read as a hole, so on a series whose
-///   spacing changes they can depend on where the range starts.
+///   and its interpolated flag treat a gap longer than twice the spacing
+///   around it as a hole. The gaps counted are those the read holds, so
+///   within eight samples of where a read starts or ends a band can depend
+///   on where the range starts or ends.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Default)]
 pub enum RateMode {
     /// Fixed-phase grid. Default.

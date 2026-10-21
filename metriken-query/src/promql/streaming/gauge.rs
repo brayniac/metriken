@@ -6,7 +6,9 @@
 //!
 //! * [`GaugeStepGrid`] — bare `metric{matchers}` selector at each tick,
 //!   subject to the staleness rule.
-//! * [`GaugeAvgOverTime`] — `avg_over_time(metric[range])`.
+//! * [`GaugeAvgOverTime`] — `avg_over_time(metric[range])`, the mean of the
+//!   samples in the window: each sample counts once, however long it held,
+//!   as in Prometheus.
 //! * [`GaugeIdelta`] — `idelta(metric[range])`, last-two-samples delta.
 //! * [`GaugeDeriv`] — `deriv(metric[range])`, least-squares slope of a
 //!   gauge's or a counter's values.
@@ -105,15 +107,27 @@ macro_rules! impl_at_points {
 
 impl_at_points!(GaugeStepGrid, GaugeAvgOverTime, GaugeIdelta, GaugeDeriv);
 
+/// A gauge's latest sample at each point, held for the step past it, or for
+/// the spacing of the samples around the point ([`super::spacing`]) when
+/// that is longer, and at most `staleness_ns`: a gauge read every second is
+/// held a second at a 100 ms step, and one whose rows go from 1 s to 100 ms
+/// apart is held as long as the rows around each point are apart. The read
+/// starts `staleness_ns` before the range, so a longer hold would depend on
+/// where it starts. Where the rows have no spacing (a series of two
+/// samples), `staleness_ns` is the hold.
 pub struct GaugeStepGrid {
     timestamps: Vec<u64>,
     values: Vec<i64>,
     end_ns: u64,
     staleness_ns: u64,
+    /// The spacing of the last pair asked, by the index of its later row.
+    spacing: Option<(usize, Option<u64>)>,
     place: Placement,
 }
 
 impl GaugeStepGrid {
+    /// `staleness_ns` is the longest hold, and the hold where the samples
+    /// have no spacing; see the type's docs.
     pub fn new(
         timestamps: Vec<u64>,
         values: Vec<i64>,
@@ -128,8 +142,31 @@ impl GaugeStepGrid {
             values,
             end_ns,
             staleness_ns,
+            spacing: None,
             place: Placement::new(raw, start_ns, step_ns),
         }
+    }
+
+    /// Whether the sample before `timestamps[hi]` is held `d` past it.
+    fn held(&mut self, hi: usize, d: u64) -> bool {
+        if d > self.staleness_ns {
+            return false;
+        }
+        if d <= self.place.step_ns {
+            return true;
+        }
+        // Past the step, the pair's spacing decides; one pair is asked at
+        // every point between its rows.
+        let spacing = match self.spacing {
+            Some((at, s)) if at == hi => s,
+            _ => {
+                let ts = &self.timestamps;
+                let s = metriken_storage::spacing::local_spacing(|i| ts[i], ts.len(), hi);
+                self.spacing = Some((hi, s));
+                s
+            }
+        };
+        spacing.is_none_or(|s| s >= d)
     }
 }
 
@@ -146,7 +183,7 @@ impl Iterator for GaugeStepGrid {
             }
             let ts = self.timestamps[hi - 1];
             let val = self.values[hi - 1];
-            if t.saturating_sub(ts) > self.staleness_ns {
+            if !self.held(hi, t.saturating_sub(ts)) {
                 continue;
             }
             return Some(Point::at(t, val as f64));

@@ -76,6 +76,7 @@ pub mod scan;
 pub mod schema;
 pub mod segmented;
 pub mod source;
+pub mod spacing;
 #[cfg(feature = "stream")]
 pub mod stream;
 pub mod table;

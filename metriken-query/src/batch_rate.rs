@@ -11,17 +11,16 @@
 //! An aggregate's values and bands can differ from the per-series path's in
 //! the last bits of a float: they are summed in the order points are
 //! computed rather than the order of the series. A grouped display read
-//! that ends a series with fewer than nine samples early sums its points
-//! earlier than a read that ends it at the last segment, so the two can
-//! differ the same way.
+//! that ends a series early sums its points earlier than a read that ends
+//! it at the last segment, so the two can differ the same way.
 
 use std::collections::VecDeque;
 
 use crate::display::BucketReducer;
 use crate::labels::Labels;
+use crate::promql::streaming::spacing::{self, HoleMemo, Stamped};
 use crate::promql::streaming::{
     derive_group_labels, scalar_point, AggOp, BinOp, GroupBy, LabeledPoints, Point, RateEdges,
-    SPACING_PROBE,
 };
 
 /// What the dispatcher asks a source for.
@@ -39,8 +38,9 @@ pub(crate) struct GridRateRequest<'a> {
     /// `rate(x[r])` with `span_ns` as `r`: a window starts as
     /// `CounterGridRate::over_range` says.
     pub range: bool,
-    /// The reach of a series' window start (`range_start`), for a series
-    /// that does not carry its table's interval.
+    /// The reach of a series' window start (`range_start`) where the samples
+    /// around it have no spacing, for a series that does not carry its
+    /// table's interval.
     pub reach_ns: u64,
     /// Aggregate the series, or `None` for one result per series.
     pub group: Option<(AggOp, GroupBy<'a>)>,
@@ -74,24 +74,33 @@ pub(crate) struct Sample {
     pub window: Option<(u64, u64)>,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct Kept {
     ts: u64,
     cum: f64,
     window: Option<(u64, u64)>,
+    hole: HoleMemo,
+}
+
+impl Stamped for Kept {
+    fn ts(&self) -> u64 {
+        self.ts
+    }
+    fn hole(&self) -> &HoleMemo {
+        &self.hole
+    }
 }
 
 /// One series' grid rate, fed one sample at a time: `CounterGridRate`'s
-/// arithmetic, with the grid advanced when a sample at or past the next point
-/// arrives rather than by pulling. Expects samples in increasing time order;
-/// out-of-order input gives points that differ from `CounterGridRate`'s.
+/// arithmetic, with the grid advanced when the samples a point reads have
+/// arrived (through [`spacing::SIDE_GAPS`] past it) rather than by pulling.
+/// Expects samples in increasing time order; out-of-order input gives points
+/// that differ from `CounterGridRate`'s.
 pub(crate) struct SeriesRate {
     windowed: bool,
-    /// The reach of a `rate`'s window start; see `range_start`.
+    /// The reach of a `rate`'s window start where the samples around it have
+    /// no spacing; see `range_start`.
     reach_ns: u64,
-    probe: Vec<Sample>,
-    settled: bool,
-    typical: u64,
     pulled: usize,
     prev_value: Option<u64>,
     acc: f64,
@@ -121,9 +130,6 @@ impl SeriesRate {
         Self {
             windowed,
             reach_ns,
-            probe: Vec::new(),
-            settled: false,
-            typical: 1,
             pulled: 0,
             prev_value: None,
             acc: 0.0,
@@ -139,11 +145,7 @@ impl SeriesRate {
 
     /// The time of the last sample pushed, or `None` before the first.
     pub fn last_ts(&self) -> Option<u64> {
-        if self.settled {
-            self.last_ts
-        } else {
-            self.probe.last().map(|s| s.ts)
-        }
+        self.last_ts
     }
 
     /// The time of the earliest grid point this series can still emit, or
@@ -162,15 +164,11 @@ impl SeriesRate {
         self.ended_early = true;
     }
 
-    /// The spacing of this series' samples: the typical spacing once
-    /// settled, the mean spacing of the samples so far while probing, or
-    /// `None` with fewer than two.
+    /// The spacing of this series' latest samples (the median of the last
+    /// gaps; see [`spacing`]), or `None` with fewer than two.
     pub fn spacing_ns(&self) -> Option<u64> {
-        if self.settled {
-            return Some(self.typical);
-        }
-        let (first, last) = (self.probe.first()?, self.probe.last()?);
-        (self.probe.len() >= 2).then(|| (last.ts - first.ts) / (self.probe.len() as u64 - 1))
+        let kept = &self.kept;
+        metriken_storage::spacing::local_spacing(|i| kept[i].ts, kept.len(), kept.len())
     }
 
     /// Whether [`end_early`](Self::end_early) finished this series.
@@ -182,48 +180,16 @@ impl SeriesRate {
         if self.done {
             return;
         }
-        if !self.settled {
-            self.probe.push(s);
-            if self.probe.len() == SPACING_PROBE {
-                self.settle(grid, series, sink);
-            }
-            return;
-        }
         self.ingest(s);
         self.advance(false, grid, series, sink);
     }
 
     /// The stream has ended: evaluate what the samples cover.
     pub fn finish(&mut self, grid: &Grid, series: usize, sink: &mut dyn Sink) {
-        if !self.settled {
-            self.settle(grid, series, sink);
+        if self.pulled < 2 {
+            self.done = true;
         }
         self.advance(true, grid, series, sink);
-    }
-
-    fn settle(&mut self, grid: &Grid, series: usize, sink: &mut dyn Sink) {
-        self.settled = true;
-        let mut spacings: Vec<u64> = self
-            .probe
-            .windows(2)
-            .map(|w| w[1].ts - w[0].ts)
-            .take(SPACING_PROBE - 1)
-            .collect();
-        spacings.sort_unstable();
-        self.typical = spacings
-            .get(spacings.len() / 2)
-            .copied()
-            .unwrap_or(1)
-            .max(1);
-        if self.probe.len() < 2 || grid.step_ns == 0 {
-            self.done = true;
-            self.probe = Vec::new();
-            return;
-        }
-        for s in std::mem::take(&mut self.probe) {
-            self.ingest(s);
-            self.advance(false, grid, series, sink);
-        }
     }
 
     fn ingest(&mut self, s: Sample) {
@@ -247,19 +213,23 @@ impl SeriesRate {
             ts: s.ts,
             cum: self.acc,
             window: s.window,
+            hole: HoleMemo::default(),
         });
     }
 
     fn advance(&mut self, exhausted: bool, grid: &Grid, series: usize, sink: &mut dyn Sink) {
+        if grid.step_ns == 0 {
+            self.done = true;
+        }
         while !self.done {
             let t = self.cursor_ns;
             if t > grid.end_ns {
                 self.done = true;
                 return;
             }
-            // The point needs a sample at or past it, unless there are no
-            // more.
-            if !exhausted && self.kept.back().is_none_or(|k| k.ts < t) {
+            // The point needs a sample at or past it and the samples after
+            // that its pairs' spacing reads, unless there are no more.
+            if !exhausted && !spacing::sees_past(&self.kept, t) {
                 return;
             }
             match self.cursor_ns.checked_add(grid.step_ns) {
@@ -272,12 +242,17 @@ impl SeriesRate {
                 None => continue,
             };
             // Past the last sample, as `CounterGridRate` does: held when that
-            // sample is within the typical spacing of the range's end,
-            // nothing otherwise.
+            // sample is within its spacing there of the range's end, nothing
+            // otherwise.
             let (at, from) = match self.last_ts.filter(|last| exhausted && t > *last) {
                 None => (t, left),
                 Some(last)
-                    if self.pulled >= 2 && grid.end_ns.saturating_sub(last) <= self.typical =>
+                    if self.pulled >= 2
+                        && spacing::at_least(
+                            &self.kept,
+                            self.kept.len(),
+                            grid.end_ns.saturating_sub(last),
+                        ) == Some(true) =>
                 {
                     (last, last.saturating_sub(t - left))
                 }
@@ -287,13 +262,7 @@ impl SeriesRate {
                 }
             };
             let from = if grid.range {
-                match crate::promql::streaming::range_start(
-                    &self.kept,
-                    |k| k.ts,
-                    from,
-                    at,
-                    self.reach_ns,
-                ) {
+                match crate::promql::streaming::range_start(&self.kept, from, at, self.reach_ns) {
                     Some(from) => from,
                     None => continue,
                 }
@@ -309,9 +278,7 @@ impl SeriesRate {
     }
 
     fn trim(&mut self, left: u64) {
-        while self.kept.len() >= 2 && self.kept[1].ts <= left {
-            self.kept.pop_front();
-        }
+        spacing::trim(&mut self.kept, left);
     }
 
     fn observed(&self, edge: u64) -> bool {
@@ -350,9 +317,9 @@ impl SeriesRate {
         };
         let frac = (edge - k_lo.ts) as f64 / (k_hi.ts - k_lo.ts) as f64;
         let cum = Some(k_lo.cum + frac * (k_hi.cum - k_lo.cum));
-        // A hole: the reads either side are further apart than twice the
-        // typical spacing, and no read describes the edge.
-        let hole = self.pulled >= 2 && k_hi.ts - k_lo.ts > self.typical.saturating_mul(2);
+        // A hole: the reads either side are further apart than twice their
+        // spacing, and no read describes the edge.
+        let hole = spacing::is_hole(&self.kept, hi);
         let window = if !self.windowed || hole {
             None
         } else {
@@ -410,7 +377,8 @@ impl SeriesRate {
 }
 
 /// A `rate`'s reach (`range_start`) for a table read every `interval_s`
-/// seconds: two intervals.
+/// seconds, where the samples around a window's start have no spacing of
+/// their own: two intervals.
 pub(crate) fn interval_reach(interval_s: f64) -> u64 {
     ((interval_s * 2e9) as u64).max(1)
 }

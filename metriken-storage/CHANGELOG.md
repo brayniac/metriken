@@ -5,6 +5,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- Added `spacing`: the spacing of a series' rows near a pair of them (the
+  larger of the median of up to eight gaps before the pair and the median of
+  up to eight after it), `spacing_at_least`, which compares it with a value
+  without sorting, `pair_spacings`, the spacing of every pair of a table's
+  rows with holes marked, and `spacing_range`, the finest and coarsest of
+  those. `SamplerReader::spacing_range` answers the last for a table, from
+  its row timestamps, once.
+
 ## [0.4.0] - 2026-10-19
 
 ### Changed

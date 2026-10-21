@@ -670,6 +670,8 @@ pub struct SamplerReader {
     /// WAL tail is materialized at open — so one read is enough, and the
     /// viewer holds its readers for the life of the process.
     row_timestamps: std::sync::OnceLock<Vec<u64>>,
+    /// [`Self::spacing_range`], worked out once from the row timestamps.
+    spacing_range: std::sync::OnceLock<Option<(f64, f64)>>,
 }
 
 impl SamplerReader {
@@ -925,6 +927,20 @@ impl SamplerReader {
             self.reader()
                 .map(|r| r.source().sample_timestamps())
                 .unwrap_or_default()
+        })
+    }
+
+    /// The finest and the coarsest spacing of this table's rows outside
+    /// holes, in seconds ([`crate::spacing::spacing_range`]), or `None` with
+    /// fewer than two rows. Unlike [`interval`](Self::interval), measured
+    /// from every row, so a table whose spacing changes (100 ms rows, then
+    /// 1 s rows) answers (0.1, 1.0) where `interval` answers the median of
+    /// its first rows or its mean gap. Reads
+    /// [`row_timestamps`](Self::row_timestamps) on first use.
+    pub fn spacing_range(&self) -> Option<(f64, f64)> {
+        *self.spacing_range.get_or_init(|| {
+            crate::spacing::spacing_range(self.row_timestamps())
+                .map(|(lo, hi)| (lo as f64 / 1e9, hi as f64 / 1e9))
         })
     }
 }
@@ -1456,6 +1472,7 @@ impl ArchiveReader {
                     occupant_segments: std::sync::Mutex::new(OccupantSegments::new()),
                     keep: std::sync::atomic::AtomicBool::new(false),
                     row_timestamps: std::sync::OnceLock::new(),
+                    spacing_range: std::sync::OnceLock::new(),
                 }));
             }
 
@@ -1600,6 +1617,7 @@ impl ArchiveReader {
                     occupant_segments: std::sync::Mutex::new(OccupantSegments::new()),
                     keep: std::sync::atomic::AtomicBool::new(false),
                     row_timestamps: std::sync::OnceLock::new(),
+                    spacing_range: std::sync::OnceLock::new(),
                 }));
             }
         }
